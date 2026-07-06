@@ -1,0 +1,9 @@
+pandas>=2.1
+numpy>=1.26
+scipy>=1.11
+pydantic>=2.5
+fastapi>=0.109
+uvicorn>=0.27
+httpx>=0.26
+pytest>=7.4
+python-dotenv>=1.0
