@@ -598,6 +598,8 @@ const STORAGE_CTS = {
   EXEC_STATE: "cts-v1-exec-state",
   SHOW_DIAG: "cts-v1-show-diagnostics",
   GAMMA_PARITY_AUDIT: "cts-v1-gamma-parity-audit-enabled", // NEW dev-only switch, no legacy key
+  GAMMA_SNAPSHOTS: "cts-v1-gamma-snapshots", // manual/external per-ticker snapshot overrides
+  GAMMA_MODE: "cts-v1-gamma-mode", // "OFF" | "SHADOW" | "ACTIVE" — directive Phase 6, default SHADOW
 };
 
 // Legacy MTS keys (exact strings from the current app — DO NOT change these).
@@ -706,18 +708,37 @@ function buildParityAuditRecord(args) {
     (oldAction === "S2O" && gammaVetoedShort)
   );
 
+  // v.25.9 — directive Phase 9: explicit CONFIRMS/CONFLICTS/NEUTRAL/UNAVAILABLE
+  // classification, distinct from the veto-based disagreement_flag above
+  // (kept for backward compat with the existing GAMMA_PARITY_AUDIT log).
+  // "Confirms": Gamma alignment agrees with the legacy open direction.
+  // "Conflicts": Gamma alignment opposes it. "Neutral": Gamma is valid but
+  // not strongly aligned either way. "Unavailable": Gamma wasn't valid.
+  let gammaClassification = "UNAVAILABLE";
+  if (gammaSpineResult && gammaSpineResult.dataValid && oldDirection !== "flat") {
+    const align = oldDirection === "long" ? gammaSpineResult.alignment.alignLong : gammaSpineResult.alignment.alignShort;
+    if (align >= 0.20) gammaClassification = "CONFIRMS";
+    else if (align <= -0.20) gammaClassification = "CONFLICTS";
+    else gammaClassification = "NEUTRAL";
+  } else if (gammaSpineResult && gammaSpineResult.dataValid) {
+    gammaClassification = "NEUTRAL"; // valid data, no open legacy direction to compare against
+  }
+  const distanceToFlipPct = gammaSpineResult && gammaSpineResult.relationship ? gammaSpineResult.relationship.distFlipPct : null;
+
   return {
     timestamp,
     ticker,
     price,
     old_engine_direction: oldDirection,
     old_engine_action: oldAction,
+    old_engine_legends_green: (legacyEngine && legacyEngine.legendsGreenCount != null) ? legacyEngine.legendsGreenCount : null,
     v10_port_active_spine: gammaSpineResult ? gammaSpineResult.activeSpine : null,
     v10_port_gamma_status: gammaSpineResult ? gammaSpineResult.status : null,
     v10_port_gamma_regime: gammaSpineResult && gammaSpineResult.snapshot ? gammaSpineResult.snapshot.gammaRegime : null,
     v10_port_gamma_gauge: gammaSpineResult && gammaSpineResult.snapshot ? gammaSpineResult.snapshot.gammaGauge : null,
     v10_port_confidence: gammaSpineResult && gammaSpineResult.snapshot ? gammaSpineResult.snapshot.confidenceScore : null,
     gamma_flip: gammaSpineResult && gammaSpineResult.snapshot ? gammaSpineResult.snapshot.gammaFlip : null,
+    distance_to_flip_pct: distanceToFlipPct,
     positive_wall: gammaSpineResult && gammaSpineResult.snapshot ? gammaSpineResult.snapshot.positiveGammaWall : null,
     negative_pit: gammaSpineResult && gammaSpineResult.snapshot ? gammaSpineResult.snapshot.negativeGammaPit : null,
     technical_station: null, // filled by caller if legacy MTF station is available
@@ -730,6 +751,7 @@ function buildParityAuditRecord(args) {
     gamma_long_soft_veto: gammaVetoedLong || false,
     gamma_short_soft_veto: gammaVetoedShort || false,
     disagreement_flag: disagreement,
+    classification: gammaClassification, // CONFIRMS | CONFLICTS | NEUTRAL | UNAVAILABLE
   };
 }
 
@@ -1545,9 +1567,11 @@ function computeAccountStats(paperAccount, ledger, livePrices) {
 // ============================================================================
 // v.24.3 — Massive Treasury Yields fetch (Economy API)
 // ============================================================================
-async function fetchTreasuryYields(apiKey) {
-  // Treasury Yields endpoint returns latest yields by maturity
-  const url = `https://api.massive.com/fed/v1/treasury-yields?limit=1&sort=date.desc&apiKey=${apiKey}`;
+async function fetchTreasuryYields() {
+  // v.25.9 — SECURITY MIGRATION (ToF V1.1): was a direct browser->Massive call
+  // with apiKey in the query string. Now calls the same-origin secure proxy;
+  // the Massive key lives only in Netlify's server-side environment.
+  const url = `/.netlify/functions/equity-snapshot?op=treasuryYields`;
   const resp = await fetch(url);
   if (!resp.ok) return null;
   const j = await resp.json();
@@ -1569,27 +1593,27 @@ async function fetchTreasuryYields(apiKey) {
 // v.25 — Multi-Timeframe Trend Gate
 // 1H bars (EMA21) + Daily bars (SMA200) → bullish / bearish / neutral
 // ============================================================================
-async function fetchHourlyBars(ticker, apiKey) {
+async function fetchHourlyBars(ticker) {
   const to = ymdDaysAgo(0);
   const from = ymdDaysAgo(15);
-  return await fetchMassiveBars(ticker, 1, "hour", from, to, apiKey);
+  return await fetchMassiveBars(ticker, 1, "hour", from, to);
 }
-async function fetchDailyBars(ticker, apiKey) {
+async function fetchDailyBars(ticker) {
   const to = ymdDaysAgo(0);
   const from = ymdDaysAgo(365);
-  return await fetchMassiveBars(ticker, 1, "day", from, to, apiKey);
+  return await fetchMassiveBars(ticker, 1, "day", from, to);
 }
 
 // v.25.8a — MTF Ladder needs 5m and 4H bars in addition to existing 15m/1H/D
-async function fetchFiveMinBars(ticker, apiKey) {
+async function fetchFiveMinBars(ticker) {
   const to = ymdDaysAgo(0);
   const from = ymdDaysAgo(5);   // last 5 days of 5m bars
-  return await fetchMassiveBars(ticker, 5, "minute", from, to, apiKey);
+  return await fetchMassiveBars(ticker, 5, "minute", from, to);
 }
-async function fetchFourHourBars(ticker, apiKey) {
+async function fetchFourHourBars(ticker) {
   const to = ymdDaysAgo(0);
   const from = ymdDaysAgo(60);  // last 60 days of 4H bars
-  return await fetchMassiveBars(ticker, 4, "hour", from, to, apiKey);
+  return await fetchMassiveBars(ticker, 4, "hour", from, to);
 }
 
 // ============================================================================
@@ -3292,8 +3316,9 @@ function computeBBCycle(bars, opts) {
 // ============================================================================
 // v.20 — Massive.com REST Client
 // ============================================================================
-async function fetchMassiveBars(ticker, multiplier, timespan, fromYMD, toYMD, apiKey) {
-  const url = `https://api.massive.com/v2/aggs/ticker/${ticker}/range/${multiplier}/${timespan}/${fromYMD}/${toYMD}?adjusted=true&sort=asc&limit=5000&apiKey=${apiKey}`;
+async function fetchMassiveBars(ticker, multiplier, timespan, fromYMD, toYMD) {
+  // v.25.9 — SECURITY MIGRATION: same-origin proxy, no apiKey in browser.
+  const url = `/.netlify/functions/equity-snapshot?op=bars&ticker=${encodeURIComponent(ticker)}&multiplier=${multiplier}&timespan=${timespan}&from=${fromYMD}&to=${toYMD}`;
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Massive HTTP ${resp.status}`);
   const j = await resp.json();
@@ -3307,6 +3332,52 @@ function ymdDaysAgo(n) {
   const d = new Date();
   d.setDate(d.getDate() - n);
   return d.toISOString().slice(0, 10);
+}
+
+// ============================================================================
+// v.25.9 — ToF V1.1 LIVE OCM GAMMA INGESTION (directive Phase 4)
+// Calls the secure server-side OCM pipeline and adapts its response shape
+// into the RawGammaSnapshotInput shape gamma-spine.js's normalizeGammaSnapshot()
+// already expects (it accepts either camelCase or snake_case field names).
+// This does NOT replace the manual/external-paste bridge in the Deck Gamma
+// panel — that remains available as an operator override — but it means
+// normal operation no longer DEPENDS on a human pasting JSON.
+// ============================================================================
+async function fetchOcmGammaSnapshot(symbol) {
+  const url = `/.netlify/functions/ocm-gamma-snapshot?symbol=${encodeURIComponent(symbol)}`;
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    let msg = `OCM HTTP ${resp.status}`;
+    try { const j = await resp.json(); if (j && j.message) msg = j.message; } catch (e) {}
+    throw new Error(msg);
+  }
+  const ocm = await resp.json();
+  // Adapt OCM's normalized-snapshot schema -> gamma-spine.js's expected input.
+  // OCM uses timestampUtc (ISO string); gamma-spine.js wants snapshotTimestamp
+  // as an epoch-ms number.
+  return {
+    ocmRaw: ocm, // kept for the Deck panel's raw OCM fields (regime interpretation, coverage, etc.)
+    adapted: {
+      sourceLabel: "OCM Live (" + (ocm.source || "MASSIVE_OPTIONS") + ")",
+      schemaVersion: ocm.schemaVersion || "1.0",
+      snapshotId: ocm.snapshotId,
+      snapshotTimestamp: ocm.timestampUtc ? Date.parse(ocm.timestampUtc) : null,
+      confidenceScore: ocm.confidenceScore,
+      gammaGauge: ocm.gammaGauge,
+      gammaRegime: ocm.gammaRegime,
+      gammaFlip: ocm.gammaFlip,
+      positiveGammaWall: ocm.positiveGammaWall,
+      negativeGammaPit: ocm.negativeGammaPit,
+      nearestPositiveAbove: ocm.nearestPositiveAbove,
+      nearestNegativeBelow: ocm.nearestNegativeBelow,
+      zeroDTENetGEX: ocm.zeroDteNetGex,
+      totalNetGEX: ocm.totalNetGex,
+      // staleThresholdMinutes/minConfidence left at gamma-spine.js defaults
+      // (15 min / 40) — OCM's own `stale`/`status` are informative but the
+      // Gamma Spine's own validateGammaSnapshot() re-derives dataValid from
+      // the raw fields for a single, consistent validation path.
+    },
+  };
 }
 
 // ============================================================================
@@ -3442,13 +3513,17 @@ const SP500 = [
   "WBD","LRCX","MAR","GEHC","ON","BIIB","COIN","SMCI","MSTR","NET",
 ];
 
-async function fetchSnapshot(tickers, apiKey) {
-  // v.25.5 — batched to handle universes >100 tickers (URL length limits)
+async function fetchSnapshot(tickers) {
+  // v.25.9 — SECURITY MIGRATION: same-origin proxy, no apiKey in browser.
+  // Preserves original 300-ticker batching behavior client-side (the proxy
+  // also re-batches server-side for the upstream Massive call, but keeping
+  // client-side batching too avoids very long query strings for ~650-ticker
+  // universe pulls).
   const BATCH_SIZE = 300;
   const all = [];
   for (let i = 0; i < tickers.length; i += BATCH_SIZE) {
     const batch = tickers.slice(i, i + BATCH_SIZE);
-    const url = `https://api.massive.com/v2/snapshot/locale/us/markets/stocks/tickers?tickers=${batch.join(",")}&apiKey=${apiKey}`;
+    const url = `/.netlify/functions/equity-snapshot?op=snapshot&tickers=${batch.join(",")}`;
     try {
       const resp = await fetch(url);
       if (!resp.ok) { console.warn(`[v.25.5] Snapshot batch ${i/BATCH_SIZE + 1} HTTP ${resp.status}`); continue; }
@@ -3467,9 +3542,9 @@ async function fetchSnapshot(tickers, apiKey) {
   return all;
 }
 
-async function fetchGroupedDaily(dateYMD, apiKey) {
-  // Returns all US stocks' daily OHLCV for the given date
-  const url = `https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks/${dateYMD}?adjusted=true&apiKey=${apiKey}`;
+async function fetchGroupedDaily(dateYMD) {
+  // v.25.9 — SECURITY MIGRATION: same-origin proxy, no apiKey in browser.
+  const url = `/.netlify/functions/equity-snapshot?op=grouped&date=${dateYMD}`;
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Grouped HTTP ${resp.status}`);
   const j = await resp.json();
@@ -3479,7 +3554,7 @@ async function fetchGroupedDaily(dateYMD, apiKey) {
   return j.results || [];
 }
 
-async function buildAvgVolume20d(tickers, apiKey) {
+async function buildAvgVolume20d(tickers) {
   // v.25.8g — LOUD diagnostics: track successes vs failures + emit console logs
   const days = [];
   for (let i = 1; i <= 30; i++) days.push(ymdDaysAgo(i));
@@ -3491,7 +3566,7 @@ async function buildAvgVolume20d(tickers, apiKey) {
   console.log(`[v.25.8g] buildAvgVolume20d start — universe ${tickers.length} tickers, trying ${days.length} days...`);
   for (const day of days) {
     try {
-      const results = await fetchGroupedDaily(day, apiKey);
+      const results = await fetchGroupedDaily(day);
       let matchCount = 0;
       for (const r of results) {
         if (tickerSet.has(r.T)) {
@@ -3816,7 +3891,7 @@ function LoginPage({ onLogin }) {
 // ============================================================================
 // AccountSummary — with dark mode toggle
 // ============================================================================
-function AccountSummary({ account, positions, universe, darkMode, setDarkMode, onLogout, onSelect, riskProfile, onRetakeRisk, polygonKey, onSetPolygonKey, paperAccount, onResetAccount, sessions, onNewSession, onDeleteSession, liveData, scannerStatus, topRVOL, ledger, onResetLedger, showDiagnostics, onToggleDiagnostics, livePrices, multiTickerEngine, gammaParityAuditEnabled, onToggleGammaParityAudit }) {
+function AccountSummary({ account, positions, universe, darkMode, setDarkMode, onLogout, onSelect, riskProfile, onRetakeRisk, paperAccount, onResetAccount, sessions, onNewSession, onDeleteSession, liveData, scannerStatus, topRVOL, ledger, onResetLedger, showDiagnostics, onToggleDiagnostics, livePrices, multiTickerEngine, gammaParityAuditEnabled, onToggleGammaParityAudit }) {
   // v.24.3 — Open positions sourced from live account stats (ledger-derived)
   const openPositions = (account.openPositions || []).map(p => ({
     sym: p.sym, side: p.side, pnl: p.pnl,
@@ -3896,7 +3971,17 @@ function AccountSummary({ account, positions, universe, darkMode, setDarkMode, o
       <PaperLedger ledger={ledger} onReset={onResetLedger} livePrices={livePrices} multiTickerEngine={multiTickerEngine} />
 
       {/* v.19 — Polygon Key */}
-      <PolygonKeyField value={polygonKey} onChange={onSetPolygonKey} />
+      {/* v.25.9 — SECURITY MIGRATION: Massive API key entry UI removed.
+          The key now lives only in Netlify's server-side environment
+          (MASSIVE_API_KEY). See SECURITY.md. */}
+      <div style={{ backgroundColor: C.surface, borderColor: C.border }} className="border rounded-xl p-3">
+        <div className="flex items-center gap-2 mb-1">
+          <Key size={12} color={C.muted} />
+          <div style={{ color: C.muted }} className="text-[11px] tracking-[0.2em] font-mono font-bold">MASSIVE DATA CONNECTION</div>
+        </div>
+        <div style={{ color: C.text }} className="text-xs font-mono">Server-managed — no key stored in this browser.</div>
+        <div style={{ color: C.dim }} className="text-[11px] mt-1">Equity: Stocks Starter (15-min delayed). Options: Options Starter (15-min delayed).</div>
+      </div>
       {showDiagnostics && <ScannerStatus status={scannerStatus} topRVOL={topRVOL} />}
 
       {/* v.19 — Sessions */}
@@ -4360,7 +4445,7 @@ function Active({ universe, positions, onSelect }) {
 // ============================================================================
 // Deck
 // ============================================================================
-function Deck({ ticker, universe, positions, setPositions, fills, setFills, onBack, gammaSnapshots, gammaBridgeEnabled, gammaBridgeMode, setGammaSnapshotForTicker, multiTickerEngine, gammaParityAuditEnabled, parityAuditLogRef }) {
+function Deck({ ticker, universe, positions, setPositions, fills, setFills, onBack, gammaSnapshots, gammaBridgeEnabled, gammaBridgeMode, setGammaSnapshotForTicker, multiTickerEngine, gammaParityAuditEnabled, parityAuditLogRef, liveGammaSnapshots, gammaMode, ocmStatus }) {
   const data = universe.find(t => t.sym === ticker);
   const [mmgState, setMmgState] = useState(data.mmgState);
   const [campaign, setCampaign] = useState(data.campaign);
@@ -4412,7 +4497,14 @@ function Deck({ ticker, universe, positions, setPositions, fills, setFills, onBa
   // ==========================================================================
   const mtEngine = (multiTickerEngine && multiTickerEngine[ticker]) ? multiTickerEngine[ticker] : null;
   const engineForGamma = mtEngine && mtEngine.engine;
-  const gammaSnapshotRaw = gammaSnapshots ? gammaSnapshots[ticker] : null;
+  // v.25.9 — Manual override (paste JSON) takes priority when present;
+  // otherwise fall back to the live OCM snapshot for this ticker, so normal
+  // operation no longer depends on a human pasting JSON (directive Phase 4).
+  const manualOverride = gammaSnapshots ? gammaSnapshots[ticker] : null;
+  const liveEntry = liveGammaSnapshots ? liveGammaSnapshots[ticker] : null; // { ocmRaw, adapted } | null
+  const liveAdapted = liveEntry ? liveEntry.adapted : null;
+  const gammaSnapshotRaw = manualOverride || liveAdapted || null;
+  const gammaSnapshotSource = manualOverride ? "MANUAL" : (liveAdapted ? "LIVE_OCM" : "NONE");
 
   // Liquidity + legacy ladder inputs: use the real engine's values when this
   // ticker is in the live top-20 RVOL poll; otherwise pass nulls (module
@@ -4573,11 +4665,15 @@ function Deck({ ticker, universe, positions, setPositions, fills, setFills, onBa
         gammaBridgeEnabled={gammaBridgeEnabled}
         gammaBridgeMode={gammaBridgeMode}
         gammaSnapshotRaw={gammaSnapshotRaw}
+        gammaSnapshotSource={gammaSnapshotSource}
         setGammaSnapshotForTicker={setGammaSnapshotForTicker}
         gammaAddFavorable={gammaAddFavorable}
         gammaTPPressure={gammaTPPressure}
         gammaExitPressure={gammaExitPressure}
         position={position}
+        gammaMode={gammaMode}
+        ocmStatus={ocmStatus}
+        ocmRaw={liveEntry ? liveEntry.ocmRaw : null}
       />
       {pendingAction && <ConfirmModal action={pendingAction} ticker={ticker} price={data.price} position={position.side !== "flat" ? position : null} onConfirm={handleConfirm} onCancel={() => setPendingAction(null)} />}
     </div>
@@ -4588,7 +4684,7 @@ function Deck({ ticker, universe, positions, setPositions, fills, setFills, onBa
 // GammaSpinePanel — Deck-level Gamma Spine display + manual snapshot bridge
 // (Patch 6 + Patch 7). Pure display/input component; owns no execution logic.
 // ============================================================================
-function GammaSpinePanel({ ticker, gammaSpineResult, gammaBridgeEnabled, gammaBridgeMode, gammaSnapshotRaw, setGammaSnapshotForTicker, gammaAddFavorable, gammaTPPressure, gammaExitPressure, position }) {
+function GammaSpinePanel({ ticker, gammaSpineResult, gammaBridgeEnabled, gammaBridgeMode, gammaSnapshotRaw, gammaSnapshotSource, setGammaSnapshotForTicker, gammaAddFavorable, gammaTPPressure, gammaExitPressure, position, gammaMode, ocmStatus, ocmRaw }) {
   const [showInput, setShowInput] = useState(false);
   const [draftJSON, setDraftJSON] = useState(gammaSnapshotRaw ? JSON.stringify(gammaSnapshotRaw, null, 2) : "");
   const [inputError, setInputError] = useState(null);
@@ -4621,6 +4717,26 @@ function GammaSpinePanel({ ticker, gammaSpineResult, gammaBridgeEnabled, gammaBr
         <div style={{ color: active ? C.long : C.dim }} className="text-[11px] font-mono font-bold uppercase">{spineLabel === "GAMMA_SPINE" ? "ACTIVE" : "LEGACY FALLBACK"}</div>
       </div>
 
+      {/* directive Phase 6/8 — mode + connection + source, always visible,
+          never merged into any field labeled "Regime" (which is legacy). */}
+      <div className="grid grid-cols-3 gap-1.5 mb-2">
+        <div style={{ backgroundColor: C.bg, borderColor: C.border }} className="border rounded px-2 py-1">
+          <div style={{ color: C.dim }} className="text-[10px] tracking-wider">MODE</div>
+          <div style={{ color: gammaMode === "ACTIVE" ? C.short : C.long }} className="text-[11px] font-mono font-bold">{gammaMode || "SHADOW"}</div>
+        </div>
+        <div style={{ backgroundColor: C.bg, borderColor: C.border }} className="border rounded px-2 py-1">
+          <div style={{ color: C.dim }} className="text-[10px] tracking-wider">OCM</div>
+          <div style={{ color: ocmStatus && ocmStatus.state === "LIVE" ? C.long : C.dim }} className="text-[11px] font-mono font-bold">{ocmStatus ? ocmStatus.state : "UNAVAILABLE"}</div>
+        </div>
+        <div style={{ backgroundColor: C.bg, borderColor: C.border }} className="border rounded px-2 py-1">
+          <div style={{ color: C.dim }} className="text-[10px] tracking-wider">SOURCE</div>
+          <div style={{ color: C.text }} className="text-[11px] font-mono font-bold">{gammaSnapshotSource || "NONE"}</div>
+        </div>
+      </div>
+      {ocmStatus && ocmStatus.error && (
+        <div style={{ color: C.short }} className="text-[11px] font-mono mb-2">OCM error: {ocmStatus.error}</div>
+      )}
+
       {!gammaSpineResult && (
         <div style={{ color: C.dim }} className="text-[12px]">Gamma Spine module not loaded.</div>
       )}
@@ -4629,9 +4745,51 @@ function GammaSpinePanel({ ticker, gammaSpineResult, gammaBridgeEnabled, gammaBr
         <div className="space-y-2">
           <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[12px] font-mono">
             <div style={{ color: C.muted }}>Status</div>
-            <div style={{ color: C.text }} className="text-right">{gammaSpineResult.status}</div>
+            <div style={{ color: (ocmRaw && ocmRaw.gammaStatus) ? (ocmRaw.gammaStatus === "GAMMA VALID" ? C.long : (ocmRaw.gammaStatus.includes("DEGRADED") || ocmRaw.gammaStatus === "GAMMA STALE") ? C.short : C.close) : C.text }} className="text-right font-bold">{(ocmRaw && ocmRaw.gammaStatus) || gammaSpineResult.status}</div>
             <div style={{ color: C.muted }}>Data valid</div>
             <div style={{ color: gammaSpineResult.dataValid ? C.long : C.short }} className="text-right font-bold">{gammaSpineResult.dataValid ? "yes" : "no"}</div>
+            {gammaSpineResult.dataValid && gammaSpineResult.snapshot && (
+              <React.Fragment>
+                <div style={{ color: C.muted }}>Dealer pressure</div>
+                <div style={{ color: C.text }} className="text-right">
+                  {gammaSpineResult.snapshot.gammaRegime === "POSITIVE" ? "Stabilizing (pinning)" :
+                   gammaSpineResult.snapshot.gammaRegime === "NEGATIVE" ? "Accelerating" :
+                   gammaSpineResult.snapshot.gammaRegime === "TRANSITION" ? "Transitioning" : "—"}
+                </div>
+                <div style={{ color: C.muted }}>Expected behavior</div>
+                <div style={{ color: C.text }} className="text-right text-[11px]">
+                  {gammaSpineResult.snapshot.gammaRegime === "POSITIVE" ? "Buy dips / sell rips, lower expansion risk" :
+                   gammaSpineResult.snapshot.gammaRegime === "NEGATIVE" ? "Buy rips / sell dips, higher expansion risk" :
+                   gammaSpineResult.snapshot.gammaRegime === "TRANSITION" ? "Regime uncertain near flip" : "—"}
+                </div>
+                {ocmRaw && ocmRaw.gammaFreshnessStatus && (
+                  <React.Fragment>
+                    <div style={{ color: C.muted }}>OCM status</div>
+                    <div style={{ color: ocmRaw.gammaStatus === "GAMMA VALID" ? C.long : (ocmRaw.gammaStatus || "").includes("DEGRADED") || ocmRaw.gammaStatus === "GAMMA STALE" ? C.short : C.close }} className="text-right font-bold text-[11px]">{ocmRaw.gammaStatus || "—"}</div>
+                    <div style={{ color: C.muted }}>Data mode</div>
+                    <div style={{ color: C.text }} className="text-right">{ocmRaw.dataMode || "UNKNOWN"}</div>
+                    <div style={{ color: C.muted }}>Spot freshness</div>
+                    <div style={{ color: ocmRaw.spotFreshnessStatus === "FRESH" ? C.long : ocmRaw.spotFreshnessStatus === "STALE" ? C.short : C.close }} className="text-right font-bold">{ocmRaw.spotFreshnessStatus || "UNKNOWN"}{ocmRaw.spotAgeMinutes != null ? " (" + Math.round(ocmRaw.spotAgeMinutes) + "m)" : ""}</div>
+                    <div style={{ color: C.muted }}>Options freshness</div>
+                    <div style={{ color: ocmRaw.optionsFreshnessStatus === "FRESH" ? C.long : ocmRaw.optionsFreshnessStatus === "STALE" ? C.short : C.close }} className="text-right font-bold">{ocmRaw.optionsFreshnessStatus || "UNKNOWN"}{ocmRaw.optionsAgeMinutes != null ? " (" + Math.round(ocmRaw.optionsAgeMinutes) + "m)" : ""}</div>
+                    <div style={{ color: C.muted }}>Chain completeness</div>
+                    <div style={{ color: ocmRaw.completenessStatus === "COMPLETE" ? C.long : ocmRaw.completenessStatus === "TRUNCATED" ? C.short : C.close }} className="text-right font-bold">{ocmRaw.completenessStatus || "UNKNOWN"}{ocmRaw.truncated ? " (page limit hit)" : ""}</div>
+                    {ocmRaw.gammaStatusReasons && ocmRaw.gammaStatusReasons.length > 0 && (
+                      <React.Fragment>
+                        <div style={{ color: C.muted }}>OCM reasons</div>
+                        <div style={{ color: C.dim }} className="text-right text-[10px]">{ocmRaw.gammaStatusReasons.join(", ")}</div>
+                      </React.Fragment>
+                    )}
+                  </React.Fragment>
+                )}
+                {ocmRaw && ocmRaw.quality && (
+                  <React.Fragment>
+                    <div style={{ color: C.muted }}>Coverage</div>
+                    <div style={{ color: C.text }} className="text-right">{ocmRaw.quality.contractsUsed}/{ocmRaw.quality.contractsSeen} contracts, {ocmRaw.pagesFetched || 0} page(s)</div>
+                  </React.Fragment>
+                )}
+              </React.Fragment>
+            )}
             {gammaSpineResult.station && (
               <React.Fragment>
                 <div style={{ color: C.muted }}>Station</div>
@@ -4940,7 +5098,7 @@ function ScannerStatus({ status, topRVOL }) {
         <div style={{ color: C.muted }}>Tickers w/ avg</div><div style={{ color: C.text }} className="text-right">{status.tickersFound || 0}</div>
         <div style={{ color: C.muted }}>Top 20 loaded</div><div style={{ color: C.text }} className="text-right">{(topRVOL && topRVOL.length) || 0}</div>
       </div>
-      <div style={{ color: C.dim }} className="text-[11px] mt-2">Scanner shows top 20 S&amp;P stocks by Relative Volume vs 20-day average.</div>
+      <div style={{ color: C.dim }} className="text-[11px] mt-2">Scanner shows Top 20 by Relative Volume vs 20-day average, ranked across the Expanded Universe (~650 tickers: S&amp;P 500 + Nasdaq-100 + liquid ETFs + momentum names — not S&amp;P 500 only).</div>
     </div>
   );
 }
@@ -5443,7 +5601,11 @@ function MTSApp() {
   const [darkMode, setDarkMode] = useState(false);
   // v.19 state
   const [riskProfile, setRiskProfile] = useState(() => loadJSONCts("RISK", null));
-  const [polygonKey, setPolygonKey] = useState(() => loadJSONCts("KEY", ""));
+  // v.25.9 — SECURITY MIGRATION: polygonKey state REMOVED. The Massive API
+  // key is no longer held, stored, or transmitted by the browser at all —
+  // it lives only in Netlify's server-side MASSIVE_API_KEY environment
+  // variable (see SECURITY.md). All data fetches below now gate on
+  // `loggedIn` alone and call same-origin /.netlify/functions/* endpoints.
   const [paperAccount, setPaperAccount] = useState(() => loadJSONCts("ACCT", { balance: 100000, startingBalance: 100000, openedAt: Date.now() }));
   const [sessions, setSessions] = useState(() => loadJSONCts("SESS", []));
   const [ledger, setLedger] = useState(() => loadJSONCts("LEDGER", []));
@@ -5463,6 +5625,34 @@ function MTSApp() {
   const [gammaSnapshots, setGammaSnapshots] = useState(() => loadJSONCts("GAMMA_SNAPSHOTS", {}));
   const [gammaBridgeEnabled, setGammaBridgeEnabled] = useState(true);
   const [gammaBridgeMode, setGammaBridgeMode] = useState("EXTERNAL_SNAPSHOT"); // "OFF" | "MANUAL" | "EXTERNAL_SNAPSHOT"
+
+  // v.25.9 — ToF V1.1 directive Phase 6: GAMMA_SHADOW_MODE.
+  // GAMMA_MODE governs whether Gamma may influence anything beyond
+  // display/logging. Default is SHADOW and must stay SHADOW unless a human
+  // deliberately flips it — this code never sets it to ACTIVE itself, and
+  // nothing downstream (processEngineSignals, the paper ledger, session
+  // state, scanner ranking) reads gammaMode at all, by design: those paths
+  // are wired only to the legacy engine, never to Gamma, regardless of mode.
+  // ACTIVE currently has NO enabled behavior difference from SHADOW in this
+  // build — it exists as a labeled, auditable placeholder for a future,
+  // separately-approved integration step. See GAMMA_SHADOW_MODE.md.
+  const [gammaMode, setGammaMode] = useState(() => {
+    const stored = loadJSONCts("GAMMA_MODE", "SHADOW");
+    return (stored === "OFF" || stored === "SHADOW" || stored === "ACTIVE") ? stored : "SHADOW";
+  });
+  const setGammaModeChecked = (next) => {
+    if (next !== "OFF" && next !== "SHADOW" && next !== "ACTIVE") return;
+    setGammaMode(next);
+    saveJSONCts("GAMMA_MODE", next);
+    console.log("[GAMMA_SHADOW_MODE] mode changed to " + next + " (deliberate, auditable — see console history)");
+  };
+
+  // v.25.9 — Live OCM Gamma snapshots, keyed by ticker. Ephemeral (not
+  // persisted): re-fetched on each poll. This is SEPARATE from
+  // gammaSnapshots (manual/pasted overrides, persisted) — Deck prefers a
+  // manual override when present, else falls back to the live snapshot.
+  const [liveGammaSnapshots, setLiveGammaSnapshots] = useState({});
+  const [ocmStatus, setOcmStatus] = useState({ state: "UNAVAILABLE", lastFetch: null, error: null });
   const setGammaSnapshotForTicker = (ticker, snapshot) => {
     setGammaSnapshots(prev => {
       const next = { ...prev, [ticker]: snapshot };
@@ -5484,7 +5674,7 @@ function MTSApp() {
 
   const completeRiskAssessment = (profile) => { setRiskProfile(profile); saveJSONCts("RISK", profile); setOverlay(null); };
   const cancelRiskAssessment = () => { if (riskProfile) setOverlay(null); };
-  const updatePolygonKey = (k) => { setPolygonKey(k); saveJSONCts("KEY", k); };
+  // updatePolygonKey removed — see security migration note above.
   const resetPaperAccount = () => { const fresh = { balance: 100000, startingBalance: 100000, openedAt: Date.now() }; setPaperAccount(fresh); saveJSONCts("ACCT", fresh); };
   const createSession = (session) => { const next = [session, ...sessions]; setSessions(next); saveJSONCts("SESS", next); setOverlay(null); };
 
@@ -5505,11 +5695,11 @@ function MTSApp() {
   // v.24.3 — Treasury yields (refreshes once on login + daily)
   const [treasuryYields, setTreasuryYields] = useState(null);
   useEffect(() => {
-    if (!polygonKey || !loggedIn) return;
+    if (!loggedIn) return;
     let cancelled = false;
     const pull = async () => {
       try {
-        const y = await fetchTreasuryYields(polygonKey);
+        const y = await fetchTreasuryYields();
         if (cancelled || !y) return;
         setTreasuryYields(y);
         console.log("[v.24.3] Treasury yields:", y);
@@ -5520,14 +5710,14 @@ function MTSApp() {
     pull();
     const iv = setInterval(pull, 24 * 60 * 60 * 1000); // refresh daily
     return () => { cancelled = true; clearInterval(iv); };
-  }, [polygonKey, loggedIn]);
+  }, [loggedIn]);
   useEffect(() => {
-    if (!polygonKey || !loggedIn) return;
+    if (!loggedIn) return;
     let cancelled = false;
     const pull = async () => {
       try {
         const syms = Object.values(HEARTBEAT_LIVE).map(h => h.sym);
-        const snaps = await fetchSnapshot(syms, polygonKey);
+        const snaps = await fetchSnapshot(syms);
         if (cancelled) return;
         const map = {};
         for (const key of Object.keys(HEARTBEAT_LIVE)) {
@@ -5550,7 +5740,7 @@ function MTSApp() {
     pull();
     const iv = setInterval(pull, 60000);
     return () => { cancelled = true; clearInterval(iv); };
-  }, [polygonKey, loggedIn]);
+  }, [loggedIn]);
 
   // v.23 — Multi-ticker engine state: { TICKER: { indicators, engine, bars, lastFetch } }
   const [multiTickerEngine, setMultiTickerEngine] = useState({});
@@ -5560,10 +5750,36 @@ function MTSApp() {
 
   // v.21 — Top-20 RVOL scanner
   const [topRVOL, setTopRVOL] = useState([]);
+
+  // v.25.9 — Live OCM Gamma polling for the currently-open Deck ticker only.
+  // Scoped deliberately: polling live options data for all ~20 scanner
+  // tickers every minute would multiply Massive Options API call volume
+  // 20x for a feature that's still Shadow-only/advisory. This can be
+  // widened to the full scanner set in a later, separately-reviewed pass
+  // (see INTEGRATION_REPORT.md "known limitations").
+  useEffect(() => {
+    if (!loggedIn || gammaMode === "OFF" || view !== "deck" || !selected) return;
+    let cancelled = false;
+    const pull = async () => {
+      try {
+        const result = await fetchOcmGammaSnapshot(selected);
+        if (cancelled) return;
+        setLiveGammaSnapshots(prev => ({ ...prev, [selected]: result })); // { ocmRaw, adapted }
+        setOcmStatus({ state: "LIVE", lastFetch: Date.now(), error: null });
+      } catch (e) {
+        if (cancelled) return;
+        setOcmStatus({ state: "UNAVAILABLE", lastFetch: Date.now(), error: e.message });
+        console.warn("[OCM] live snapshot fetch failed for " + selected + ":", e.message);
+      }
+    };
+    pull();
+    const iv = setInterval(pull, 60000);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, [loggedIn, gammaMode, view, selected]);
   const [scannerStatus, setScannerStatus] = useState({ status: "idle", lastFetch: null, avgVolDate: null, tickersFound: 0 });
 
   useEffect(() => {
-    if (!polygonKey || !loggedIn) return;
+    if (!loggedIn) return;
     let cancelled = false;
 
     // Ensure 20-day avg vol cache is fresh (rebuilds if missing or >24h old)
@@ -5576,7 +5792,7 @@ function MTSApp() {
       }
       setScannerStatus(s => ({ ...s, status: "building" }));
       console.log("[v.25.5] Building 20-day avg volume cache from EXPANDED_UNIVERSE (~650 tickers, one-time, ~30s)...");
-      const built = await buildAvgVolume20d(EXPANDED_UNIVERSE, polygonKey);
+      const built = await buildAvgVolume20d(EXPANDED_UNIVERSE);
       if (cancelled) return null;
       saveJSON(STORAGE_AVGVOL, built);
       setScannerStatus(s => ({ ...s, avgVolDate: new Date(built.builtAt).toLocaleDateString(), tickersFound: built.tickersFound }));
@@ -5588,7 +5804,7 @@ function MTSApp() {
       try {
         const avg = await ensureAvgVolume();
         if (cancelled || !avg) return;
-        const snaps = await fetchSnapshot(EXPANDED_UNIVERSE, polygonKey);
+        const snaps = await fetchSnapshot(EXPANDED_UNIVERSE);
         if (cancelled) return;
         const ranked = [];
         for (const s of snaps) {
@@ -5628,11 +5844,11 @@ function MTSApp() {
     pullScanner();
     const iv = setInterval(pullScanner, 60000);
     return () => { cancelled = true; clearInterval(iv); };
-  }, [polygonKey, loggedIn]);
+  }, [loggedIn]);
 
   // v.23/v.25 — Multi-ticker engine + execution for top-20 RVOL tickers (with trend gate)
   useEffect(() => {
-    if (!polygonKey || !loggedIn || !riskProfile || !topRVOL || topRVOL.length === 0) return;
+    if (!loggedIn || !riskProfile || !topRVOL || topRVOL.length === 0) return;
     let cancelled = false;
     // v.25.5 — union top-20 RVOL + all open-position tickers so exits fire even after drop-out
     const scanTickers = topRVOL.slice(0, 20).map(t => t.sym);
@@ -5650,7 +5866,7 @@ function MTSApp() {
         const results = await Promise.allSettled(batch.map(async (sym) => {
           const to = ymdDaysAgo(0);
           const from = ymdDaysAgo(10);
-          const bars = await fetchMassiveBars(sym, 15, "minute", from, to, polygonKey);
+          const bars = await fetchMassiveBars(sym, 15, "minute", from, to);
           if (cancelled || bars.length < 100) return null;
           const ind = computeIndicators(bars);
           const engine = computeMMGEngineState(bars, { debug: showDiagnostics, ticker: "TSLA" });
@@ -5669,10 +5885,10 @@ function MTSApp() {
             const needDaily   = !cache.dailyAt   || (now - cache.dailyAt)   > DAILY_TTL;
             if (needFiveMin || needHourly || needFourHr || needDaily) {
               const [m5, h1, h4, d1] = await Promise.all([
-                needFiveMin ? fetchFiveMinBars(sym, polygonKey)  : Promise.resolve(cache.fiveMin),
-                needHourly  ? fetchHourlyBars(sym, polygonKey)   : Promise.resolve(cache.hourly),
-                needFourHr  ? fetchFourHourBars(sym, polygonKey) : Promise.resolve(cache.fourHr),
-                needDaily   ? fetchDailyBars(sym, polygonKey)    : Promise.resolve(cache.daily),
+                needFiveMin ? fetchFiveMinBars(sym)  : Promise.resolve(cache.fiveMin),
+                needHourly  ? fetchHourlyBars(sym)   : Promise.resolve(cache.hourly),
+                needFourHr  ? fetchFourHourBars(sym) : Promise.resolve(cache.fourHr),
+                needDaily   ? fetchDailyBars(sym)    : Promise.resolve(cache.daily),
               ]);
               trendCacheRef.current[sym] = {
                 fiveMin: m5, hourly: h1, fourHr: h4, daily: d1,
@@ -5728,12 +5944,12 @@ function MTSApp() {
     pullAll();
     const iv2 = setInterval(pullAll, 60000);
     return () => { cancelled = true; clearInterval(iv2); };
-  }, [polygonKey, loggedIn, riskProfile, topRVOL.map(t => t.sym).join(",")]);
+  }, [loggedIn, riskProfile, topRVOL.map(t => t.sym).join(",")]);
 
 
   // v.23 — Multi-ticker engine + execution for top-20 RVOL tickers
   useEffect(() => {
-    if (!polygonKey || !loggedIn || !riskProfile || !topRVOL || topRVOL.length === 0) return;
+    if (!loggedIn || !riskProfile || !topRVOL || topRVOL.length === 0) return;
     let cancelled = false;
     // v.25.5 — union top-20 RVOL + all open-position tickers so exits fire even after drop-out
     const scanTickers = topRVOL.slice(0, 20).map(t => t.sym);
@@ -5752,7 +5968,7 @@ function MTSApp() {
         const results = await Promise.allSettled(batch.map(async (sym) => {
           const to = ymdDaysAgo(0);
           const from = ymdDaysAgo(10);
-          const bars = await fetchMassiveBars(sym, 15, "minute", from, to, polygonKey);
+          const bars = await fetchMassiveBars(sym, 15, "minute", from, to);
           if (cancelled || bars.length < 100) return null;
           const ind = computeIndicators(bars);
           const engine = computeMMGEngineState(bars, { debug: showDiagnostics, ticker: sym });
@@ -5791,7 +6007,7 @@ function MTSApp() {
     pullAll();
     const iv2 = setInterval(pullAll, 60000);
     return () => { cancelled = true; clearInterval(iv2); };
-  }, [polygonKey, loggedIn, riskProfile, topRVOL.map(t => t.sym).join(",")]);
+  }, [loggedIn, riskProfile, topRVOL.map(t => t.sym).join(",")]);
 
   // v.24.3: merged live macro tiles map: heartbeat ETFs + treasury yields
   const liveMacroMap = useMemo(() => {
@@ -5967,7 +6183,6 @@ function MTSApp() {
           darkMode={darkMode} setDarkMode={setDarkMode}
           onLogout={() => setLoggedIn(false)} onSelect={(sym) => handleSelect(sym, "account")}
           riskProfile={riskProfile} onRetakeRisk={() => setOverlay("risk-assessment")}
-          polygonKey={polygonKey} onSetPolygonKey={updatePolygonKey}
           paperAccount={paperAccount} onResetAccount={resetPaperAccount}
           sessions={sessions} onNewSession={() => setOverlay("session-create")}
           onDeleteSession={(id) => {
@@ -5988,6 +6203,7 @@ function MTSApp() {
           gammaSnapshots={gammaSnapshots} gammaBridgeEnabled={gammaBridgeEnabled} gammaBridgeMode={gammaBridgeMode}
           setGammaSnapshotForTicker={setGammaSnapshotForTicker} multiTickerEngine={multiTickerEngine}
           gammaParityAuditEnabled={gammaParityAuditEnabled} parityAuditLogRef={parityAuditLogRef}
+          liveGammaSnapshots={liveGammaSnapshots} gammaMode={gammaMode} ocmStatus={ocmStatus}
         />}
       </div>
       {showTabs && <BottomTabBar view={view} setView={setView} activeCount={activeCount} />}
