@@ -1,0 +1,17 @@
+[build]
+  functions = "netlify/functions"
+  publish = "."
+
+[functions]
+  node_bundler = "esbuild"
+
+# Same-origin only. The browser calls /.netlify/functions/* on the same
+# domain as the deployed site, so no cross-origin CORS relaxation is needed.
+# If you later split frontend/API into separate domains, add explicit
+# Access-Control-Allow-Origin headers scoped to your exact frontend origin
+# (never "*") inside each function's response headers.
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200
