@@ -600,6 +600,9 @@ const STORAGE_CTS = {
   GAMMA_PARITY_AUDIT: "cts-v1-gamma-parity-audit-enabled", // NEW dev-only switch, no legacy key
   GAMMA_SNAPSHOTS: "cts-v1-gamma-snapshots", // manual/external per-ticker snapshot overrides
   GAMMA_MODE: "cts-v1-gamma-mode", // "OFF" | "SHADOW" | "ACTIVE" — directive Phase 6, default SHADOW
+  ECM_MODE: "cts-v1-ecm-mode", // ECM v1.0: "OFF" | "ON" — autonomous paper trading master switch, default OFF
+  ECM_JOURNAL: "cts-v1-ecm-journal", // ECM v1.0: persisted action journal (fills + skips w/ reasons), capped
+  ECM_QUALITY: "cts-v1-ecm-quality-config", // ECM v1.0 Task 3: quality-engine threshold overrides
 };
 
 // Legacy MTS keys (exact strings from the current app — DO NOT change these).
@@ -1223,6 +1226,11 @@ function todayETISO() {
   return fmt.format(new Date()); // YYYY-MM-DD
 }
 
+// ECM v1.0 Task 2 — current hour in US/Eastern (0-23), for the EOD rule.
+function etHourNow() {
+  return parseInt(new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", hour12: false }).format(new Date()), 10);
+}
+
 // Is today within an active session range?
 function activeSessionForToday(sessions) {
   const today = todayETISO();
@@ -1231,6 +1239,121 @@ function activeSessionForToday(sessions) {
     if (s.startDate <= today && today <= s.endDate) return s;
   }
   return null;
+}
+
+// ============================================================================
+// ECM v1.0 Task 2 — protective exits (STOP enforcement + EOD flatten).
+// SELF-CONTAINED pure function: no React, no gamma, no external helpers —
+// deliberately dependency-free so tests/ecm.test.js can extract and execute
+// it directly in Node for functional (not just static) verification.
+// Called ONLY when ECM_MODE === "ON"; with ECM OFF, legacy behavior is
+// untouched (stops remain informational, exactly as before ECM existed).
+// ============================================================================
+function enforceEcmProtectiveExits({ ledger, account, execState, currentPrices, nowEtHour }) {
+  const newLedger = ledger.slice();
+  const newAccount = Object.assign({}, account);
+  const newExecState = Object.assign({}, execState);
+  const exits = [];
+  const journal = [];
+  const isEod = typeof nowEtHour === "number" && nowEtHour >= 16;
+
+  for (let i = 0; i < newLedger.length; i++) {
+    const t = newLedger[i];
+    if (t.status !== "open") continue;
+    const px = currentPrices ? currentPrices[t.ticker] : null;
+    if (px == null || !(px > 0)) continue; // no price -> no action (never guess)
+
+    let exitType = null;
+    let reason = null;
+    if (t.stopPrice != null) {
+      if (t.dir === 1 && px <= t.stopPrice) { exitType = "STOP"; reason = "STOP_HIT"; }
+      else if (t.dir === -1 && px >= t.stopPrice) { exitType = "STOP"; reason = "STOP_HIT"; }
+    }
+    if (!exitType && isEod) { exitType = "EOD"; reason = "EOD_FLATTEN"; }
+    if (!exitType) continue;
+
+    const closeShares = t.currentShares;
+    const pnl = t.dir === 1 ? (px - t.entryPrice) * closeShares : (t.entryPrice - px) * closeShares;
+    const closed = Object.assign({}, t, {
+      status: "closed",
+      currentShares: 0,
+      realizedPnL: (t.realizedPnL || 0) + pnl,
+      closedAt: Date.now(),
+      exitType,
+      exitPrice: px,
+    });
+    newLedger[i] = closed;
+    newAccount.balance = (newAccount.balance || 0) + pnl;
+    const ts = Object.assign({}, newExecState[t.ticker] || {});
+    ts.lastExitTime = Date.now(); // existing re-entry cooldown applies
+    newExecState[t.ticker] = ts;
+    exits.push({ ticker: t.ticker, type: exitType, shares: closeShares, price: px, pnl, time: Date.now() });
+    journal.push({ t: Date.now(), sigTime: null, ticker: t.ticker, signal: null, action: "EXIT", reason, exitType, shares: closeShares, price: px, pnl });
+  }
+  return { newLedger, newAccount, newExecState, exits, journal };
+}
+
+// ============================================================================
+// ECM v1.0 Task 3 — QUALITY ENGINE.
+// Sits between Scanner candidates and Paper Orders: every B2O/S2O entry
+// candidate is APPROVED or REJECTED, never silently ignored. It does NOT
+// modify scanner rankings, RVOL, the MMG engine, Five Legends, or signal
+// generation — it only decides whether a signal may become a trade.
+//
+// CENTRALIZED CONFIG — the ONLY place quality thresholds live. Overrides
+// persist under STORAGE_CTS.ECM_QUALITY (localStorage) and are merged at
+// call time; nothing is hardcoded elsewhere in the codebase.
+//   minLegends: 3  — directive default; reject entries below 3/5 greens.
+//   minRvol:    0  — directive: "Default = existing scanner RVOL", i.e. no
+//                    additional floor beyond the scanner's own ranking; the
+//                    candidate's scanner RVOL passes as-is. Raise to demand
+//                    above-average volume (e.g. 1.5).
+// ============================================================================
+const ECM_QUALITY_DEFAULTS = { minLegends: 3, minRvol: 0 };
+function loadEcmQualityConfig() {
+  try {
+    const raw = localStorage.getItem(STORAGE_CTS.ECM_QUALITY);
+    const over = raw ? JSON.parse(raw) : {};
+    return Object.assign({}, ECM_QUALITY_DEFAULTS, over || {});
+  } catch (e) { return Object.assign({}, ECM_QUALITY_DEFAULTS); }
+}
+
+// Pure + self-contained (no React/DOM/helpers) so tests execute it directly.
+// candidate: { sigType, legendsGreenCount, rvol, trendState, hasActiveSession,
+//              dailyHalted, hasOpenPosition, cooldownActive }
+// Missing metrics (null/undefined legends, rvol, or trend) NEVER cause a
+// rejection — the engine only rejects on evidenced rule failures, matching
+// the codebase-wide "never guess" discipline. Rules evaluated in directive
+// order; first failure wins.
+function ecmQualityCheck(candidate, config) {
+  const cfg = config || { minLegends: 3, minRvol: 0 };
+  const c = candidate || {};
+  const metrics = {
+    legends: (typeof c.legendsGreenCount === "number") ? c.legendsGreenCount : null,
+    rvol: (typeof c.rvol === "number") ? c.rvol : null,
+    trend: c.trendState || null,
+  };
+  const reject = (reason) => ({ decision: "REJECTED", reason, metrics });
+
+  // 1. Five Legends minimum
+  if (metrics.legends != null && metrics.legends < cfg.minLegends) return reject("LOW_LEGEND_SCORE");
+  // 2. RVOL minimum
+  if (metrics.rvol != null && metrics.rvol < cfg.minRvol) return reject("LOW_RVOL");
+  // 3. Trend alignment (only when a known trend state is supplied)
+  if (metrics.trend && metrics.trend !== "unknown") {
+    if (c.sigType === "B2O" && metrics.trend !== "bullish") return reject("TREND_MISMATCH");
+    if (c.sigType === "S2O" && metrics.trend !== "bearish") return reject("TREND_MISMATCH");
+  }
+  // 4. Session filter
+  if (!c.hasActiveSession) return reject("SESSION_CLOSED");
+  // 5. Daily halt
+  if (c.dailyHalted) return reject("DAILY_HALT");
+  // 6. Duplicate position
+  if (c.hasOpenPosition) return reject("POSITION_ALREADY_OPEN");
+  // 7. Cooldown
+  if (c.cooldownActive) return reject("COOLDOWN");
+
+  return { decision: "APPROVED", reason: null, metrics };
 }
 
 // Compute next-bar-open price for the bar immediately AFTER a signal bar.
@@ -1268,7 +1391,7 @@ function realizedPnLToday(ledger) {
  * v.24: Hardened with global maxPos, equity-based daily stop, per-ticker cooldown,
  * total notional cap, and tighter signal quality requirements.
  */
-function processEngineSignals({ ticker, engine, bars, atr, ledger, execState, account, riskProfile, sessions, currentPrices, trendGate }) {
+function processEngineSignals({ ticker, engine, bars, atr, ledger, execState, account, riskProfile, sessions, currentPrices, trendGate, legendsGreenCount, rvol, qualityConfig, ecmOn }) {
   if (!engine || !engine.signalHistory || engine.signalHistory.length === 0) {
     return { newLedger: ledger, newExecState: execState, newAccount: account, fills: [] };
   }
@@ -1285,6 +1408,16 @@ function processEngineSignals({ ticker, engine, bars, atr, ledger, execState, ac
   let newExecState = Object.assign({}, execState);
   let newAccount = Object.assign({}, account);
   const fills = [];
+  // ECM v1.0 Task 1 — action journal: records every executed action AND every
+  // skipped signal with its reason. Additive return field; existing callers
+  // that only read newLedger/newExecState/newAccount/fills are unaffected.
+  const journal = [];
+  const jot = (ticker, sig, action, reason, extra) => {
+    journal.push(Object.assign({
+      t: Date.now(), sigTime: sig ? sig.time : null, ticker,
+      signal: sig ? sig.type : null, action, reason: reason || null,
+    }, extra || {}));
+  };
 
   // v.24 FIX 1: Global maxPos enforcement
   const countOpen = (lg) => lg.filter(t => t.status === "open").length;
@@ -1338,7 +1471,7 @@ function processEngineSignals({ ticker, engine, bars, atr, ledger, execState, ac
     const last = engine.signalHistory[engine.signalHistory.length - 1];
     tickerState.lastExecutedKey = signalKey(ticker, last);
     newExecState[ticker] = tickerState;
-    return { newLedger, newExecState, newAccount, fills };
+    return { newLedger, newExecState, newAccount, fills, journal };
   }
   for (const sig of engine.signalHistory) {
     const key = signalKey(ticker, sig);
@@ -1353,25 +1486,52 @@ function processEngineSignals({ ticker, engine, bars, atr, ledger, execState, ac
     const sigType = sig.type;
 
     if (sigType === "B2O" || sigType === "S2O") {
-      if (!activeSession) { tickerState.lastExecutedKey = key; continue; }
-      if (dailyHalted) { tickerState.lastExecutedKey = key; continue; }
-      if (open) { tickerState.lastExecutedKey = key; continue; }
+      // ECM v1.0 Task 3 — QUALITY ENGINE gate. Every entry candidate gets an
+      // explicit APPROVED/REJECTED decision, journaled with legends/RVOL/
+      // trend metrics. The pre-existing gates below remain untouched as
+      // backstops (rules 4-7 are re-verified by them; quality rejections
+      // simply record the decision with the directive's reason codes first).
+      // Task 3.1 — the ENTIRE quality engine (evaluation, journaling,
+      // metrics, filtering) runs ONLY when ECM is ON. With ECM OFF, this
+      // block is skipped and the engine behaves exactly as it did before
+      // ECM existed.
+      if (ecmOn) {
+        const q = ecmQualityCheck({
+          sigType,
+          legendsGreenCount: (typeof legendsGreenCount === "number") ? legendsGreenCount : (engine && typeof engine.legendsGreenCount === "number" ? engine.legendsGreenCount : null),
+          rvol: (typeof rvol === "number") ? rvol : null,
+          trendState: trendGate ? trendGate.state : null,
+          hasActiveSession: !!activeSession,
+          dailyHalted: !!dailyHalted,
+          hasOpenPosition: !!open,
+          cooldownActive: !!(tickerState.lastExitTime && (sig.time - tickerState.lastExitTime) < RE_ENTRY_COOLDOWN_MS),
+        }, qualityConfig);
+        jot(ticker, sig, "QUALITY", q.decision === "REJECTED" ? q.reason : null, { decision: q.decision, legends: q.metrics.legends, rvol: q.metrics.rvol, trend: q.metrics.trend });
+        if (q.decision === "REJECTED") { tickerState.lastExecutedKey = key; continue; }
+      }
+      if (!activeSession) { jot(ticker, sig, "SKIP", "NO_SESSION"); tickerState.lastExecutedKey = key; continue; }
+      if (dailyHalted) { jot(ticker, sig, "SKIP", "DAILY_HALT"); tickerState.lastExecutedKey = key; continue; }
+      if (open) { jot(ticker, sig, "SKIP", "ALREADY_OPEN"); tickerState.lastExecutedKey = key; continue; }
       if (countOpen(newLedger) >= MAX_POS) {
         console.log("[v.24] " + ticker + " " + sigType + " skip: maxPos " + countOpen(newLedger) + "/" + MAX_POS);
+        jot(ticker, sig, "SKIP", "MAX_POS", { open: countOpen(newLedger), max: MAX_POS });
         tickerState.lastExecutedKey = key; continue;
       }
       if (tickerState.lastExitTime && (sig.time - tickerState.lastExitTime) < RE_ENTRY_COOLDOWN_MS) {
         console.log("[v.24] " + ticker + " " + sigType + " skip: re-entry cooldown");
+        jot(ticker, sig, "SKIP", "COOLDOWN");
         tickerState.lastExecutedKey = key; continue;
       }
       // v.25 — Trend gate: longs only in bullish regime, shorts only in bearish
       if (trendGate && trendGate.state !== "unknown") {
         if (sigType === "B2O" && trendGate.state !== "bullish") {
           console.log("[v.25] " + ticker + " B2O skip: trend gate " + trendGate.state + " (1H>" + (trendGate.hBullish?"up":"dn") + ", D>" + (trendGate.dBullish?"up":"dn") + ")");
+          jot(ticker, sig, "SKIP", "TREND_GATE", { gate: trendGate.state });
           tickerState.lastExecutedKey = key; continue;
         }
         if (sigType === "S2O" && trendGate.state !== "bearish") {
           console.log("[v.25] " + ticker + " S2O skip: trend gate " + trendGate.state + " (1H>" + (trendGate.hBullish?"up":"dn") + ", D>" + (trendGate.dBullish?"up":"dn") + ")");
+          jot(ticker, sig, "SKIP", "TREND_GATE", { gate: trendGate.state });
           tickerState.lastExecutedKey = key; continue;
         }
       }
@@ -1391,6 +1551,7 @@ function processEngineSignals({ ticker, engine, bars, atr, ledger, execState, ac
       }
       if (shares < 1) {
         console.log("[v.24] " + ticker + " " + sigType + " skip: total notional cap");
+        jot(ticker, sig, "SKIP", "NOTIONAL_CAP");
         tickerState.lastExecutedKey = key; continue;
       }
 
@@ -1405,7 +1566,7 @@ function processEngineSignals({ ticker, engine, bars, atr, ledger, execState, ac
         closedAt: null, exitType: null, exitPrice: null,
       };
       newLedger.push(trade);
-      fills.push({ ticker, type: sigType, shares, price: fillPrice, time: sig.time });
+      fills.push({ ticker, type: sigType, shares, price: fillPrice, time: sig.time }); jot(ticker, sig, "FILL", null, { ticker, type: sigType, shares, price: fillPrice, time: sig.time });
       console.log("[v.24] " + ticker + " " + sigType + " " + shares + "@" + fillPrice.toFixed(2) + " stop=" + stopPrice.toFixed(2) + " opens=" + countOpen(newLedger) + "/" + MAX_POS);
 
     } else if (sigType === "ADD" && open && open.pos.dir === sig.dir) {
@@ -1417,7 +1578,7 @@ function processEngineSignals({ ticker, engine, bars, atr, ledger, execState, ac
       open.pos.currentShares = totalShares;
       open.pos.entryPrice = newAvg;
       newLedger[open.idx] = open.pos;
-      fills.push({ ticker, type: "ADD", shares: addShares, price: fillPrice, time: sig.time });
+      fills.push({ ticker, type: "ADD", shares: addShares, price: fillPrice, time: sig.time }); jot(ticker, sig, "FILL", null, { ticker, type: "ADD", shares: addShares, price: fillPrice, time: sig.time });
       console.log("[v.24] " + ticker + " ADD +" + addShares + "@" + fillPrice.toFixed(2));
 
     } else if (sigType === "TP" && open && open.pos.dir === sig.dir) {
@@ -1431,7 +1592,7 @@ function processEngineSignals({ ticker, engine, bars, atr, ledger, execState, ac
       open.pos.realizedPnL += pnl;
       newAccount.balance += pnl;
       newLedger[open.idx] = open.pos;
-      fills.push({ ticker, type: "TP", shares: closeShares, price: fillPrice, pnl, time: sig.time });
+      fills.push({ ticker, type: "TP", shares: closeShares, price: fillPrice, pnl, time: sig.time }); jot(ticker, sig, "FILL", null, { ticker, type: "TP", shares: closeShares, price: fillPrice, pnl, time: sig.time });
       console.log("[v.24] " + ticker + " TP -" + closeShares + "@" + fillPrice.toFixed(2) + " pnl=" + pnl.toFixed(2));
 
     } else if ((sigType === "B2C" || sigType === "S2C") && open) {
@@ -1448,7 +1609,7 @@ function processEngineSignals({ ticker, engine, bars, atr, ledger, execState, ac
       newAccount.balance += pnl;
       newLedger[open.idx] = open.pos;
       tickerState.lastExitTime = sig.time;
-      fills.push({ ticker, type: sigType, shares: closeShares, price: fillPrice, pnl, time: sig.time });
+      fills.push({ ticker, type: sigType, shares: closeShares, price: fillPrice, pnl, time: sig.time }); jot(ticker, sig, "FILL", null, { ticker, type: sigType, shares: closeShares, price: fillPrice, pnl, time: sig.time });
       console.log("[v.24] " + ticker + " " + sigType + " -" + closeShares + "@" + fillPrice.toFixed(2) + " pnl=" + pnl.toFixed(2));
     }
 
@@ -1457,7 +1618,7 @@ function processEngineSignals({ ticker, engine, bars, atr, ledger, execState, ac
 
   delete tickerState._foundLast;
   newExecState[ticker] = tickerState;
-  return { newLedger, newExecState, newAccount, fills };
+  return { newLedger, newExecState, newAccount, fills, journal };
 }
 
 // Compute equity = balance + unrealized PnL across open positions
@@ -3891,7 +4052,7 @@ function LoginPage({ onLogin }) {
 // ============================================================================
 // AccountSummary — with dark mode toggle
 // ============================================================================
-function AccountSummary({ account, positions, universe, darkMode, setDarkMode, onLogout, onSelect, riskProfile, onRetakeRisk, paperAccount, onResetAccount, sessions, onNewSession, onDeleteSession, liveData, scannerStatus, topRVOL, ledger, onResetLedger, showDiagnostics, onToggleDiagnostics, livePrices, multiTickerEngine, gammaParityAuditEnabled, onToggleGammaParityAudit }) {
+function AccountSummary({ account, positions, universe, darkMode, setDarkMode, onLogout, onSelect, riskProfile, onRetakeRisk, paperAccount, onResetAccount, sessions, onNewSession, onDeleteSession, liveData, scannerStatus, topRVOL, ledger, onResetLedger, showDiagnostics, onToggleDiagnostics, livePrices, multiTickerEngine, gammaParityAuditEnabled, onToggleGammaParityAudit, ecmMode, onToggleEcmMode, ecmJournalCount }) {
   // v.24.3 — Open positions sourced from live account stats (ledger-derived)
   const openPositions = (account.openPositions || []).map(p => ({
     sym: p.sym, side: p.side, pnl: p.pnl,
@@ -3981,6 +4142,19 @@ function AccountSummary({ account, positions, universe, darkMode, setDarkMode, o
         </div>
         <div style={{ color: C.text }} className="text-xs font-mono">Server-managed — no key stored in this browser.</div>
         <div style={{ color: C.dim }} className="text-[11px] mt-1">Equity: Stocks Starter (15-min delayed). Options: Options Starter (15-min delayed).</div>
+      </div>
+
+      {/* ECM v1.0 — autonomous paper trader control card */}
+      <div style={{ backgroundColor: C.surface, borderColor: C.border }} className="border rounded-xl p-3">
+        <div className="flex items-center gap-2 mb-1">
+          <Zap size={12} color={ecmMode === "ON" ? C.long : C.muted} />
+          <div style={{ color: C.muted }} className="text-[11px] tracking-[0.2em] font-mono font-bold flex-1">ECM AUTONOMOUS PAPER TRADER</div>
+          <button onClick={onToggleEcmMode}
+            style={{ backgroundColor: ecmMode === "ON" ? C.long : C.bg, color: ecmMode === "ON" ? "#fff" : C.dim, borderColor: C.border }}
+            className="border rounded px-2 py-0.5 text-[11px] font-mono font-bold">{ecmMode}</button>
+        </div>
+        <div style={{ color: C.text }} className="text-xs font-mono">{ecmMode === "ON" ? "Autonomous: daily session auto-created; paper entries/exits run unattended." : "Manual: entries require a manually created session (legacy behavior)."}</div>
+        <div style={{ color: C.dim }} className="text-[11px] mt-1">Paper only — no broker, no live orders. Journal: {ecmJournalCount || 0} actions recorded.</div>
       </div>
       {showDiagnostics && <ScannerStatus status={scannerStatus} topRVOL={topRVOL} />}
 
@@ -5608,6 +5782,76 @@ function MTSApp() {
   // `loggedIn` alone and call same-origin /.netlify/functions/* endpoints.
   const [paperAccount, setPaperAccount] = useState(() => loadJSONCts("ACCT", { balance: 100000, startingBalance: 100000, openedAt: Date.now() }));
   const [sessions, setSessions] = useState(() => loadJSONCts("SESS", []));
+
+  // ==========================================================================
+  // ECM v1.0 Task 1 — autonomous paper-trading control plane.
+  // ECM_MODE "OFF" (default): behavior identical to before ECM existed —
+  //   entries require a manually created session, exactly as always.
+  // ECM_MODE "ON": the one manual blocker (daily session creation) is
+  //   automated; a single-day session tagged ecmAuto is created each day.
+  // Paper-only by design: nothing here touches a broker, live order, or
+  // real funds. This is NOT CATS and must not be extended toward live
+  // execution without a separate, explicit directive.
+  // ==========================================================================
+  const [ecmMode, setEcmMode] = useState(() => {
+    const stored = loadJSONCts("ECM_MODE", "OFF");
+    return (stored === "OFF" || stored === "ON") ? stored : "OFF";
+  });
+  const ecmModeRef = React.useRef(ecmMode);
+  React.useEffect(() => { ecmModeRef.current = ecmMode; }, [ecmMode]);
+  const setEcmModeChecked = (next) => {
+    if (next !== "OFF" && next !== "ON") return;
+    setEcmMode(next);
+    saveJSONCts("ECM_MODE", next);
+    console.log("[ECM v1.0] mode changed to " + next + " (deliberate, auditable)");
+  };
+
+  // Persisted, deduplicated, capped action journal. Dedup is required
+  // because execState only advances on fills (pre-existing commit
+  // semantics), so the same skipped signal re-fires every 60s poll.
+  const ECM_JOURNAL_CAP = 2000;
+  const ecmJournalRef = React.useRef(null);
+  if (ecmJournalRef.current === null) ecmJournalRef.current = loadJSONCts("ECM_JOURNAL", []);
+  const [ecmJournalCount, setEcmJournalCount] = useState(() => ecmJournalRef.current.length);
+  const appendEcmJournal = (entries) => {
+    const journal = ecmJournalRef.current;
+    const seen = new Set(journal.map(e => e.ticker + "|" + e.sigTime + "|" + e.signal + "|" + e.action + "|" + (e.reason || "")));
+    let added = 0;
+    for (const e of entries) {
+      const k = e.ticker + "|" + e.sigTime + "|" + e.signal + "|" + e.action + "|" + (e.reason || "");
+      if (seen.has(k)) continue;
+      seen.add(k);
+      journal.push(e);
+      added++;
+    }
+    if (added === 0) return;
+    if (journal.length > ECM_JOURNAL_CAP) journal.splice(0, journal.length - ECM_JOURNAL_CAP);
+    saveJSONCts("ECM_JOURNAL", journal);
+    setEcmJournalCount(journal.length);
+  };
+
+  // Daily auto-session: only when ECM is ON. Session shape mirrors
+  // SessionCreateForm's output exactly; status "planned" satisfies
+  // activeSessionForToday (which excludes only "cancelled").
+  useEffect(() => {
+    if (!loggedIn || ecmMode !== "ON" || !riskProfile) return;
+    if (activeSessionForToday(sessions)) return;
+    const today = todayETISO();
+    const auto = {
+      id: "sess_ecm_" + Date.now(),
+      name: "ECM Auto " + today,
+      startDate: today, endDate: today,
+      status: "planned", universe: "SP500",
+      riskProfile: riskProfile.tier, initialBalance: 100000,
+      createdAt: Date.now(),
+      ecmAuto: true,
+    };
+    const next = [...sessions, auto];
+    setSessions(next);
+    saveJSONCts("SESS", next);
+    appendEcmJournal([{ t: Date.now(), sigTime: null, ticker: null, signal: null, action: "SESSION_AUTO_CREATED", reason: null, sessionId: auto.id }]);
+    console.log("[ECM v1.0] auto-created daily session " + auto.id);
+  }, [loggedIn, ecmMode, riskProfile, sessions]);
   const [ledger, setLedger] = useState(() => loadJSONCts("LEDGER", []));
   const [execState, setExecState] = useState(() => loadJSONCts("EXEC_STATE", {}));
   const [showDiagnostics, setShowDiagnostics] = useState(() => loadJSONCts("SHOW_DIAG", false));
@@ -5859,6 +6103,10 @@ function MTSApp() {
     const pullAll = async () => {
       const BATCH = 4;
       let curLedger = ledger, curExec = execState, curAccount = paperAccount;
+      const journalBatch = []; // ECM v1.0 — collect action-journal events this cycle
+      const ecmOn = ecmModeRef.current === "ON"; // Task 3.1 — quality engine only when ECM is ON
+      const rvolBySym = {}; // ECM v1.0 Task 3 — scanner RVOL per candidate for the quality engine
+      if (ecmOn) (topRVOL || []).forEach(t => { rvolBySym[t.sym] = t.rvol; });
       const allUpdates = {};
       for (let i = 0; i < TICKERS.length; i += BATCH) {
         if (cancelled) return;
@@ -5923,7 +6171,12 @@ function MTSApp() {
                 ticker: sym, engine, bars, atr: ind.atr14,
                 ledger: curLedger, execState: curExec, account: curAccount, riskProfile, sessions, currentPrices: cp,
                 trendGate,
+                legendsGreenCount: ecmOn && engine && typeof engine.legendsGreenCount === "number" ? engine.legendsGreenCount : null,
+                rvol: ecmOn && rvolBySym[sym] != null ? rvolBySym[sym] : null,
+                qualityConfig: ecmOn ? loadEcmQualityConfig() : null,
+                ecmOn,
               });
+              if (result.journal && result.journal.length > 0) journalBatch.push(...result.journal);
               if (result.fills.length > 0) {
                 curLedger = result.newLedger;
                 curExec = result.newExecState;
@@ -5936,6 +6189,20 @@ function MTSApp() {
       }
       if (cancelled) return;
       setMultiTickerEngine(prev => ({ ...prev, ...allUpdates }));
+      // ECM v1.0 Task 2 — protective exits (STOP + EOD), only when ECM is ON.
+      if (ecmModeRef.current === "ON") {
+        const priceMap = {};
+        Object.keys(allUpdates).forEach(s => { if (allUpdates[s].indicators) priceMap[s] = allUpdates[s].indicators.close; });
+        const prot = enforceEcmProtectiveExits({ ledger: curLedger, account: curAccount, execState: curExec, currentPrices: priceMap, nowEtHour: etHourNow() });
+        if (prot.exits.length > 0) {
+          curLedger = prot.newLedger;
+          curAccount = prot.newAccount;
+          curExec = prot.newExecState;
+          journalBatch.push(...prot.journal);
+          prot.exits.forEach(x => console.log("[ECM v1.0] " + x.ticker + " " + x.type + " exit " + x.shares + "@" + x.price.toFixed(2) + " pnl=" + x.pnl.toFixed(2)));
+        }
+      }
+      if (journalBatch.length > 0) appendEcmJournal(journalBatch);
       if (curLedger !== ledger) { setLedger(curLedger); saveJSONCts("LEDGER", curLedger); }
       if (curExec !== execState) { setExecState(curExec); saveJSONCts("EXEC_STATE", curExec); }
       if (curAccount !== paperAccount) { setPaperAccount(curAccount); saveJSONCts("ACCT", curAccount); }
@@ -5961,6 +6228,10 @@ function MTSApp() {
       // Throttle: 4 parallel max, 250ms between batches
       const BATCH = 4;
       let curLedger = ledger, curExec = execState, curAccount = paperAccount;
+      const journalBatch = []; // ECM v1.0 — collect action-journal events this cycle
+      const ecmOn = ecmModeRef.current === "ON"; // Task 3.1 — quality engine only when ECM is ON
+      const rvolBySym = {}; // ECM v1.0 Task 3 — scanner RVOL per candidate for the quality engine
+      if (ecmOn) (topRVOL || []).forEach(t => { rvolBySym[t.sym] = t.rvol; });
       const allUpdates = {};
       for (let i = 0; i < TICKERS.length; i += BATCH) {
         if (cancelled) return;
@@ -5985,7 +6256,12 @@ function MTSApp() {
               const result = processEngineSignals({
                 ticker: sym, engine, bars, atr: ind.atr14,
                 ledger: curLedger, execState: curExec, account: curAccount, riskProfile, sessions, currentPrices: cp,
+                legendsGreenCount: ecmOn && engine && typeof engine.legendsGreenCount === "number" ? engine.legendsGreenCount : null,
+                rvol: ecmOn && rvolBySym[sym] != null ? rvolBySym[sym] : null,
+                qualityConfig: ecmOn ? loadEcmQualityConfig() : null,
+                ecmOn,
               });
+              if (result.journal && result.journal.length > 0) journalBatch.push(...result.journal);
               if (result.fills.length > 0) {
                 curLedger = result.newLedger;
                 curExec = result.newExecState;
@@ -5999,6 +6275,20 @@ function MTSApp() {
       if (cancelled) return;
       setMultiTickerEngine(prev => ({ ...prev, ...allUpdates }));
       // Commit ledger/account/exec updates if anything changed
+      // ECM v1.0 Task 2 — protective exits (STOP + EOD), only when ECM is ON.
+      if (ecmModeRef.current === "ON") {
+        const priceMap = {};
+        Object.keys(allUpdates).forEach(s => { if (allUpdates[s].indicators) priceMap[s] = allUpdates[s].indicators.close; });
+        const prot = enforceEcmProtectiveExits({ ledger: curLedger, account: curAccount, execState: curExec, currentPrices: priceMap, nowEtHour: etHourNow() });
+        if (prot.exits.length > 0) {
+          curLedger = prot.newLedger;
+          curAccount = prot.newAccount;
+          curExec = prot.newExecState;
+          journalBatch.push(...prot.journal);
+          prot.exits.forEach(x => console.log("[ECM v1.0] " + x.ticker + " " + x.type + " exit " + x.shares + "@" + x.price.toFixed(2) + " pnl=" + x.pnl.toFixed(2)));
+        }
+      }
+      if (journalBatch.length > 0) appendEcmJournal(journalBatch);
       if (curLedger !== ledger) { setLedger(curLedger); saveJSONCts("LEDGER", curLedger); }
       if (curExec !== execState) { setExecState(curExec); saveJSONCts("EXEC_STATE", curExec); }
       if (curAccount !== paperAccount) { setPaperAccount(curAccount); saveJSONCts("ACCT", curAccount); }
@@ -6183,6 +6473,7 @@ function MTSApp() {
           darkMode={darkMode} setDarkMode={setDarkMode}
           onLogout={() => setLoggedIn(false)} onSelect={(sym) => handleSelect(sym, "account")}
           riskProfile={riskProfile} onRetakeRisk={() => setOverlay("risk-assessment")}
+          ecmMode={ecmMode} onToggleEcmMode={() => setEcmModeChecked(ecmMode === "ON" ? "OFF" : "ON")} ecmJournalCount={ecmJournalCount}
           paperAccount={paperAccount} onResetAccount={resetPaperAccount}
           sessions={sessions} onNewSession={() => setOverlay("session-create")}
           onDeleteSession={(id) => {
