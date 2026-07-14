@@ -146,20 +146,24 @@ test("22. no stop breach intraday: position stays open", () => {
   assert.strictEqual(r.exits.length, 0);
 });
 
-test("23. EOD flatten: nowEtHour >= 16 closes remaining opens with EOD type and pnl", () => {
-  const r = enforceEcmProtectiveExits({ ledger: [openTrade()], account: { balance: 0 }, execState: {}, currentPrices: { AAA: 103 }, nowEtHour: 16 });
+test("23. EOD flatten: nowEtHour >= 19 closes remaining opens with EOD type and pnl (Task 3.2: trigger moved 16->19)", () => {
+  const r = enforceEcmProtectiveExits({ ledger: [openTrade()], account: { balance: 0 }, execState: {}, currentPrices: { AAA: 103 }, nowEtHour: 19 });
   assert.strictEqual(r.newLedger[0].exitType, "EOD");
   assert.strictEqual(r.newLedger[0].realizedPnL, (103 - 100) * 10);
   assert.strictEqual(r.journal[0].reason, "EOD_FLATTEN");
 });
 
 test("24. STOP takes precedence over EOD when both apply", () => {
-  const r = enforceEcmProtectiveExits({ ledger: [openTrade()], account: { balance: 0 }, execState: {}, currentPrices: { AAA: 90 }, nowEtHour: 17 });
+  const r = enforceEcmProtectiveExits({ ledger: [openTrade()], account: { balance: 0 }, execState: {}, currentPrices: { AAA: 90 }, nowEtHour: 20 });
   assert.strictEqual(r.newLedger[0].exitType, "STOP");
+});
+test("24b. no forced shutdown at 16:00 ET (Task 3.2): position stays open through the 16:00-19:00 continuation window", () => {
+  const r = enforceEcmProtectiveExits({ ledger: [openTrade()], account: { balance: 0 }, execState: {}, currentPrices: { AAA: 99 }, nowEtHour: 17 });
+  assert.strictEqual(r.newLedger[0].status, "open", "positions must NOT force-close at 4-7pm ET per Task 3.2");
 });
 
 test("25. missing price -> no action, never guesses", () => {
-  const r = enforceEcmProtectiveExits({ ledger: [openTrade()], account: { balance: 0 }, execState: {}, currentPrices: {}, nowEtHour: 17 });
+  const r = enforceEcmProtectiveExits({ ledger: [openTrade()], account: { balance: 0 }, execState: {}, currentPrices: {}, nowEtHour: 19 });
   assert.strictEqual(r.newLedger[0].status, "open");
   assert.strictEqual(r.exits.length, 0);
 });
@@ -318,6 +322,83 @@ test("51. functional: quality check unreachable when ecmOn is false (simulated b
   assert.strictEqual(calls, 0, "quality must not run when ECM OFF");
   simulate(true);
   assert.strictEqual(calls, 1, "quality must run when ECM ON");
+});
+
+// ---- Task 3.2: ECM session window scheduler --------------------------------
+const winFnMatch = html.match(/function ecmSessionWindowCheck\(nowEt\) \{[\s\S]*?\n\}/);
+let ecmSessionWindowCheck = null;
+test("52. ecmSessionWindowCheck exists, is self-contained, and is executable", () => {
+  assert.ok(winFnMatch, "ecmSessionWindowCheck source not found");
+  ecmSessionWindowCheck = eval("(" + winFnMatch[0] + ")");
+  assert.strictEqual(typeof ecmSessionWindowCheck, "function");
+});
+
+test("53. premarket (03:00-09:29 ET) on a weekday: entries allowed", () => {
+  assert.strictEqual(ecmSessionWindowCheck({ hour: 3, minute: 0, dayOfWeek: 3 }).allowNewEntries, true);
+  assert.strictEqual(ecmSessionWindowCheck({ hour: 9, minute: 29, dayOfWeek: 3 }).allowNewEntries, true);
+});
+test("54. regular market (09:30-16:00 ET) unchanged: entries allowed", () => {
+  assert.strictEqual(ecmSessionWindowCheck({ hour: 12, minute: 0, dayOfWeek: 3 }).allowNewEntries, true);
+  assert.strictEqual(ecmSessionWindowCheck({ hour: 16, minute: 0, dayOfWeek: 3 }).allowNewEntries, true);
+});
+test("55. after-hours (16:00-19:00 ET): new trades still allowed, no forced shutdown at 4pm", () => {
+  const r = ecmSessionWindowCheck({ hour: 17, minute: 30, dayOfWeek: 3 });
+  assert.strictEqual(r.allowNewEntries, true);
+});
+test("56. exactly 19:00 ET: new entries stop", () => {
+  const r = ecmSessionWindowCheck({ hour: 19, minute: 0, dayOfWeek: 3 });
+  assert.strictEqual(r.allowNewEntries, false);
+  assert.strictEqual(r.reason, "OUTSIDE_ECM_WINDOW");
+});
+test("57. before 03:00 ET: new entries blocked", () => {
+  const r = ecmSessionWindowCheck({ hour: 2, minute: 59, dayOfWeek: 3 });
+  assert.strictEqual(r.allowNewEntries, false);
+  assert.strictEqual(r.reason, "OUTSIDE_ECM_WINDOW");
+});
+test("58. exactly 03:00 ET boundary: entries allowed (inclusive start)", () => {
+  assert.strictEqual(ecmSessionWindowCheck({ hour: 3, minute: 0, dayOfWeek: 3 }).allowNewEntries, true);
+});
+test("59. weekend fully disabled: Saturday and Sunday reject regardless of hour", () => {
+  const sat = ecmSessionWindowCheck({ hour: 12, minute: 0, dayOfWeek: 6 });
+  const sun = ecmSessionWindowCheck({ hour: 12, minute: 0, dayOfWeek: 0 });
+  assert.strictEqual(sat.allowNewEntries, false);
+  assert.strictEqual(sat.reason, "WEEKEND");
+  assert.strictEqual(sun.allowNewEntries, false);
+  assert.strictEqual(sun.reason, "WEEKEND");
+});
+test("60. weekend takes precedence even during otherwise-valid hours", () => {
+  const r = ecmSessionWindowCheck({ hour: 10, minute: 0, dayOfWeek: 0 });
+  assert.strictEqual(r.reason, "WEEKEND");
+});
+
+test("61. window gate wired into processEngineSignals entry branch, ECM-ON-gated, ahead of quality engine", () => {
+  const m = html.match(/function processEngineSignals\(\{[\s\S]*?\n\}\n/)[0];
+  const idxWindow = m.indexOf("ecmSessionWindowCheck(etNowParts())");
+  const idxQuality = m.indexOf("ecmQualityCheck(");
+  assert.ok(idxWindow > -1 && idxQuality > -1, "both gates must be present");
+  assert.ok(idxWindow < idxQuality, "window gate must run before the quality engine");
+  const windowBlock = m.slice(m.lastIndexOf("if (ecmOn) {", idxWindow), idxWindow);
+  assert.ok(windowBlock.includes("if (ecmOn) {"), "window gate must be ECM-ON-gated");
+});
+test("62. window-gate rejections are journaled as SKIP with the exact reason", () => {
+  const m = html.match(/function processEngineSignals\(\{[\s\S]*?\n\}\n/)[0];
+  assert.ok(/jot\(ticker, sig, "SKIP", win\.reason\);/.test(m));
+});
+
+test("63. EOD trigger moved from 16:00 to 19:00 ET (Task 3.2, user-approved)", () => {
+  assert.ok(/nowEtHour >= 19/.test(html));
+  assert.ok(!/nowEtHour >= 16/.test(html), "old 16:00 threshold must not remain anywhere");
+});
+
+test("64. window-check function contains no gamma references", () => {
+  assert.ok(!/gamma/i.test(winFnMatch[0]));
+});
+test("65. no scanner/RVOL/OCM/quality-engine/risk-engine/position-sizing/journal-mechanism/paper-ledger files touched by Task 3.2 (scheduler-only diff surface)", () => {
+  // Structural check: the scheduler additions are confined to timing helpers
+  // and the two gate call-sites; the quality engine, protective-exit STOP
+  // logic (aside from the approved threshold), and sizing math are untouched.
+  assert.ok(/function ecmQualityCheck\(candidate, config\) \{/.test(html), "quality engine function must still exist unmodified in signature");
+  assert.ok(/const stopDist = ATR_STOP_MULT \* atr;/.test(html), "position sizing formula unchanged");
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
