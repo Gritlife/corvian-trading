@@ -1231,6 +1231,35 @@ function etHourNow() {
   return parseInt(new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", hour12: false }).format(new Date()), 10);
 }
 
+// ECM v1.0 Task 3.2 — full ET time parts (hour, minute, day-of-week) for the
+// session-window scheduler. dayOfWeek: 0=Sun..6=Sat, matching Date.getDay().
+function etNowParts() {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", hour: "numeric", minute: "numeric", hour12: false, weekday: "short",
+  }).formatToParts(new Date());
+  const get = (t) => parts.find(p => p.type === t).value;
+  const dayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  let hour = parseInt(get("hour"), 10);
+  if (hour === 24) hour = 0; // Intl can emit "24" for midnight with hour12:false
+  return { hour, minute: parseInt(get("minute"), 10), dayOfWeek: dayMap[get("weekday")] };
+}
+
+// ECM v1.0 Task 3.2 — ECM session window: 03:00-19:00 ET, weekdays only.
+// Pure, self-contained (no React/DOM) so tests execute it directly. Governs
+// NEW ENTRIES only — exits/management/STOP/EOD are untouched by this gate
+// ("continue managing existing positions" per directive).
+function ecmSessionWindowCheck(nowEt) {
+  const { hour, minute, dayOfWeek } = nowEt;
+  if (dayOfWeek === 0 || dayOfWeek === 6) return { allowNewEntries: false, reason: "WEEKEND" };
+  const minutesOfDay = hour * 60 + minute;
+  const WINDOW_START = 3 * 60;   // 03:00 ET
+  const WINDOW_END = 19 * 60;    // 19:00 ET
+  if (minutesOfDay < WINDOW_START || minutesOfDay >= WINDOW_END) {
+    return { allowNewEntries: false, reason: "OUTSIDE_ECM_WINDOW" };
+  }
+  return { allowNewEntries: true, reason: null };
+}
+
 // Is today within an active session range?
 function activeSessionForToday(sessions) {
   const today = todayETISO();
@@ -1255,7 +1284,8 @@ function enforceEcmProtectiveExits({ ledger, account, execState, currentPrices, 
   const newExecState = Object.assign({}, execState);
   const exits = [];
   const journal = [];
-  const isEod = typeof nowEtHour === "number" && nowEtHour >= 16;
+  // ECM v1.0 Task 3.2 — EOD trigger moved 16:00 -> 19:00 ET to match the new 03:00-19:00 ECM session window (explicit user approval; mechanism unchanged, only the threshold).
+  const isEod = typeof nowEtHour === "number" && nowEtHour >= 19;
 
   for (let i = 0; i < newLedger.length; i++) {
     const t = newLedger[i];
@@ -1486,6 +1516,16 @@ function processEngineSignals({ ticker, engine, bars, atr, ledger, execState, ac
     const sigType = sig.type;
 
     if (sigType === "B2O" || sigType === "S2O") {
+      // ECM v1.0 Task 3.2 — SESSION WINDOW gate (03:00-19:00 ET, weekdays
+      // only). Governs new entries only; only active when ECM is ON
+      // (Task 3.1 principle: ECM OFF stays byte-identical to legacy).
+      if (ecmOn) {
+        const win = ecmSessionWindowCheck(etNowParts());
+        if (!win.allowNewEntries) {
+          jot(ticker, sig, "SKIP", win.reason);
+          tickerState.lastExecutedKey = key; continue;
+        }
+      }
       // ECM v1.0 Task 3 — QUALITY ENGINE gate. Every entry candidate gets an
       // explicit APPROVED/REJECTED decision, journaled with legends/RVOL/
       // trend metrics. The pre-existing gates below remain untouched as
