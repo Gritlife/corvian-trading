@@ -1227,6 +1227,21 @@ function todayETISO() {
 }
 
 // ECM v1.0 Task 2 — current hour in US/Eastern (0-23), for the EOD rule.
+// ECM v1.0 Signal Cursor Correction — epoch ms for today's ECM session
+// start (04:00 ET / 03:00 CT, the locked production ECM schedule). DST-aware: reads
+// the current UTC offset for America/New_York directly from Intl rather
+// than hardcoding -4/-5, so it's correct year-round without a tz library.
+function ecmSessionStartMs() {
+  const now = new Date();
+  const ymd = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(now);
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", hour12: false, timeZoneName: "shortOffset" }).formatToParts(now);
+  const offsetPart = parts.find(p => p.type === "timeZoneName");
+  const m = offsetPart && offsetPart.value.match(/GMT([+-]\d+)/);
+  const offsetHours = m ? parseInt(m[1], 10) : -5; // fallback: EST
+  const utcHour = 4 - offsetHours; // 04:00 local = (4 - offset) UTC
+  return Date.parse(ymd + "T00:00:00Z") + utcHour * 3600 * 1000;
+}
+
 function etHourNow() {
   return parseInt(new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", hour12: false }).format(new Date()), 10);
 }
@@ -1244,7 +1259,7 @@ function etNowParts() {
   return { hour, minute: parseInt(get("minute"), 10), dayOfWeek: dayMap[get("weekday")] };
 }
 
-// ECM v1.0 Task 3.2 — ECM session window: 03:00-19:00 ET, weekdays only.
+// ECM v1.0 — LOCKED PRODUCTION SCHEDULE: 04:00-20:00 ET (03:00-19:00 CT), weekdays only.
 // Pure, self-contained (no React/DOM) so tests execute it directly. Governs
 // NEW ENTRIES only — exits/management/STOP/EOD are untouched by this gate
 // ("continue managing existing positions" per directive).
@@ -1252,8 +1267,8 @@ function ecmSessionWindowCheck(nowEt) {
   const { hour, minute, dayOfWeek } = nowEt;
   if (dayOfWeek === 0 || dayOfWeek === 6) return { allowNewEntries: false, reason: "WEEKEND" };
   const minutesOfDay = hour * 60 + minute;
-  const WINDOW_START = 3 * 60;   // 03:00 ET
-  const WINDOW_END = 19 * 60;    // 19:00 ET
+  const WINDOW_START = 4 * 60;   // 04:00 ET (03:00 CT)
+  const WINDOW_END = 20 * 60;    // 20:00 ET (19:00 CT)
   if (minutesOfDay < WINDOW_START || minutesOfDay >= WINDOW_END) {
     return { allowNewEntries: false, reason: "OUTSIDE_ECM_WINDOW" };
   }
@@ -1284,8 +1299,9 @@ function enforceEcmProtectiveExits({ ledger, account, execState, currentPrices, 
   const newExecState = Object.assign({}, execState);
   const exits = [];
   const journal = [];
-  // ECM v1.0 Task 3.2 — EOD trigger moved 16:00 -> 19:00 ET to match the new 03:00-19:00 ECM session window (explicit user approval; mechanism unchanged, only the threshold).
-  const isEod = typeof nowEtHour === "number" && nowEtHour >= 19;
+  // ECM v1.0 — EOD trigger aligned to the locked production schedule's
+  // session end: 20:00 ET (19:00 CT). Mechanism unchanged, only the threshold.
+  const isEod = typeof nowEtHour === "number" && nowEtHour >= 20;
 
   for (let i = 0; i < newLedger.length; i++) {
     const t = newLedger[i];
@@ -1494,15 +1510,47 @@ function processEngineSignals({ ticker, engine, bars, atr, ledger, execState, ac
   const activeSession = activeSessionForToday(sessions);
   const tickerState = newExecState[ticker] || { lastExecutedKey: null, lastExitTime: null };
 
-  // v.25.1 — signal-replay guard: if no lastExecutedKey, prime with the most recent
-  // signal so we don't replay history and don't flip ledger state on every poll.
-  // Future signals AFTER this prime point will fire normally.
-  if (!tickerState.lastExecutedKey && engine.signalHistory.length > 0) {
-    const last = engine.signalHistory[engine.signalHistory.length - 1];
-    tickerState.lastExecutedKey = signalKey(ticker, last);
-    newExecState[ticker] = tickerState;
-    return { newLedger, newExecState, newAccount, fills, journal };
+  // ECM v1.0 Signal Cursor Correction — first poll for this ticker (no
+  // persisted cursor yet). Previously this blindly primed to the LAST
+  // signal in history and returned, silently discarding any valid
+  // current-session signal whenever Top-20 rotation caused a ticker's
+  // first-ever poll to land mid-session. Now: signals strictly before the
+  // ECM session start (04:00 ET / 03:00 CT) are skipped past (cursor advanced,
+  // preventing historical/multi-day replay); the first signal at or after
+  // session start becomes the resume point, so the existing walk-forward
+  // loop below evaluates it — and everything after it, in order — normally.
+  if (!tickerState.lastExecutedKey) {
+    const sessionStartMs = ecmSessionStartMs();
+    let firstEligibleIdx = -1;
+    for (let i = 0; i < engine.signalHistory.length; i++) {
+      if (engine.signalHistory[i].time >= sessionStartMs) { firstEligibleIdx = i; break; }
+    }
+    if (firstEligibleIdx === -1) {
+      // No eligible current-session signal yet. Advance the cursor past the
+      // latest known (stale) signal and record ONE concise diagnostic entry
+      // — not one per bar, not silent.
+      const last = engine.signalHistory[engine.signalHistory.length - 1];
+      tickerState.lastExecutedKey = signalKey(ticker, last);
+      newExecState[ticker] = tickerState;
+      journal.push({ t: Date.now(), sigTime: last.time, ticker, signal: last.type, action: "INIT", reason: "NO_ELIGIBLE_CURRENT_SESSION_SIGNAL" });
+      return { newLedger, newExecState, newAccount, fills, journal };
+    }
+    if (firstEligibleIdx > 0) {
+      const lastHistorical = engine.signalHistory[firstEligibleIdx - 1];
+      tickerState.lastExecutedKey = signalKey(ticker, lastHistorical);
+    }
+    // else: firstEligibleIdx === 0 -> leave lastExecutedKey null; the loop
+    // below then processes from the start, which IS the first eligible
+    // signal, so nothing older is replayed.
   }
+  // Cursor correction fix: when starting this call with no prior cursor
+  // (fresh ticker, or firstEligibleIdx === 0 above), the walk-forward loop
+  // below must not re-trigger its "still searching for the resume point"
+  // skip once it advances lastExecutedKey past the FIRST processed signal
+  // — otherwise a second eligible signal in the same call would be
+  // silently skipped. Pre-marking the resume point as already found is
+  // correct here specifically because there is no historical key to match.
+  if (!tickerState.lastExecutedKey) tickerState._foundLast = true;
   for (const sig of engine.signalHistory) {
     const key = signalKey(ticker, sig);
     const lastKey = tickerState.lastExecutedKey;
@@ -1516,7 +1564,7 @@ function processEngineSignals({ ticker, engine, bars, atr, ledger, execState, ac
     const sigType = sig.type;
 
     if (sigType === "B2O" || sigType === "S2O") {
-      // ECM v1.0 Task 3.2 — SESSION WINDOW gate (03:00-19:00 ET, weekdays
+      // ECM v1.0 — SESSION WINDOW gate (04:00-20:00 ET / 03:00-19:00 CT, weekdays
       // only). Governs new entries only; only active when ECM is ON
       // (Task 3.1 principle: ECM OFF stays byte-identical to legacy).
       if (ecmOn) {
@@ -3755,6 +3803,87 @@ async function fetchGroupedDaily(dateYMD) {
   return j.results || [];
 }
 
+// ============================================================================
+// ToF v1.1 — SCANNER V2: Top Opportunities Scanner
+// ============================================================================
+// Two pure, self-contained functions (no React/network) so they can be
+// executed and tested directly. RVOL remains an input everywhere, but is no
+// longer the sole or final ranking factor — see OCM_METHODOLOGY-style
+// discipline: every component below reads only fields already computed
+// elsewhere in the app (computeMMGEngineState's existing outputs), nothing
+// invented.
+
+/**
+ * STAGE 1 shortlist selection. Ranks the full lightweight-scanned universe
+ * by a COMBINED lightweight rank (RVOL rank averaged with absolute %-move
+ * rank — both available from the free snapshot endpoint, no bars needed)
+ * and returns the top `shortlistSize` candidates for full MMG evaluation.
+ * This is a widening pre-filter, not the final ranking — the directive
+ * explicitly requires the FINAL Top 20 to come from full MMG evaluation,
+ * never from this lightweight stage alone.
+ */
+function buildScannerShortlist(rankedLightweight, shortlistSize) {
+  const n = rankedLightweight.length;
+  if (n === 0) return [];
+  const byRvol = [...rankedLightweight].sort((a, b) => b.rvol - a.rvol);
+  const byMove = [...rankedLightweight].sort((a, b) => Math.abs(b.changePct || 0) - Math.abs(a.changePct || 0));
+  const rvolRank = new Map(byRvol.map((t, i) => [t.sym, i]));
+  const moveRank = new Map(byMove.map((t, i) => [t.sym, i]));
+  const combined = rankedLightweight.map(t => ({
+    t, combinedRank: (rvolRank.get(t.sym) + moveRank.get(t.sym)) / 2,
+  }));
+  combined.sort((a, b) => a.combinedRank - b.combinedRank);
+  return combined.slice(0, shortlistSize).map(x => x.t);
+}
+
+/**
+ * STAGE 2 final scoring. Takes one shortlisted ticker's already-computed
+ * MMG engine state (from computeMMGEngineState — no gamma, no OCM) plus its
+ * lightweight RVOL, and produces a 0-100 Opportunity Score with a short
+ * human-readable reason. Weights implement the directive's stated priority
+ * order: fresh B2O/S2O signal > trend alignment > Five Legends > trade
+ * strength > RVOL/volume > momentum/volatility expansion.
+ */
+function computeOpportunityScore(engine, rvolValue, barsCount) {
+  if (!engine) return { score: 0, reason: "NO_DATA", components: null };
+
+  const signalHistory = engine.signalHistory || [];
+  const lastSig = signalHistory.length ? signalHistory[signalHistory.length - 1] : null;
+  const barsSinceSignal = (lastSig && typeof barsCount === "number") ? (barsCount - 1 - lastSig.bar) : null;
+  const isFreshEntry = !!(lastSig && (lastSig.type === "B2O" || lastSig.type === "S2O") && barsSinceSignal != null && barsSinceSignal <= 8);
+  const isManaging = !!(lastSig && (lastSig.type === "ADD" || lastSig.type === "TP"));
+
+  let signalComp = 0;
+  if (isFreshEntry) signalComp = 1.0;
+  else if (isManaging) signalComp = 0.6;
+  else if (engine.activeTrainDir) signalComp = 0.3;
+
+  const trendComp = (engine.livermoreGreen ? 0.6 : 0) + (engine.activeTrainDir ? 0.4 : 0);
+  const legendsComp = (engine.legendsGreenCount || 0) / (engine.legendsTotal || 5);
+  const tradeStrengthComp = Math.max(0, Math.min(1, (engine.edgePct || 0) / 100));
+  const rvolComp = Math.max(0, Math.min(1, (rvolValue || 0) / 3));
+  const momentumComp = Math.max(0, Math.min(1, Math.abs(engine.rawConfirmScore || 0)));
+  const bbComp = Math.max(0, Math.min(1, Math.abs(engine.bbScore || 0)));
+  const volComp = Math.max(0, Math.min(1, Math.abs(engine.volumeScore || 0)));
+
+  const score = Math.round(100 * (
+    signalComp * 0.30 + trendComp * 0.20 + legendsComp * 0.15 + tradeStrengthComp * 0.10 +
+    rvolComp * 0.10 + momentumComp * 0.08 + bbComp * 0.04 + volComp * 0.03
+  ));
+
+  let reason = "NEUTRAL";
+  if (isFreshEntry) reason = lastSig.type === "B2O" ? "FRESH B2O" : "FRESH S2O";
+  else if (isManaging) reason = lastSig.type + " + STRONG TREND";
+  else if (engine.activeTrainDir === 1 && trendComp >= 0.6) reason = "BULL CONTROL";
+  else if (engine.activeTrainDir === -1 && trendComp >= 0.6) reason = "SHORT ACTIVE";
+  else if (rvolComp >= 0.8 && signalComp < 0.3) reason = "HIGH RVOL / WEAK SETUP";
+
+  return {
+    score, reason,
+    components: { signalComp, trendComp, legendsComp, tradeStrengthComp, rvolComp, momentumComp, bbComp, volComp },
+  };
+}
+
 async function buildAvgVolume20d(tickers) {
   // v.25.8g — LOUD diagnostics: track successes vs failures + emit console logs
   const days = [];
@@ -4537,7 +4666,7 @@ function Scanner({ universe, positions, onSelect }) {
   }), [enriched, filter]);
   const sorted = useMemo(() => {
     const arr = [...filtered];
-    if (sort === "score") arr.sort((a, b) => b.rvol - a.rvol); // v.25.5 — sort by RVOL until 5-Legend score lands
+    if (sort === "score") arr.sort((a, b) => (b.opportunityScore || 0) - (a.opportunityScore || 0)); // Scanner V2 — Opportunity Score, not RVOL alone
     if (sort === "alpha") arr.sort((a, b) => a.sym.localeCompare(b.sym));
     if (sort === "chg") arr.sort((a, b) => b.change - a.change);
     return arr;
@@ -4553,7 +4682,7 @@ function Scanner({ universe, positions, onSelect }) {
             className="px-2.5 py-1 rounded-full border text-[13px] font-mono whitespace-nowrap">{c.label}</button>
         ))}
         <select value={sort} onChange={e => setSort(e.target.value)} style={{ borderColor: C.border, color: C.muted, backgroundColor: C.surface }} className="ml-auto border rounded-full px-2 py-1 text-[13px] font-mono">
-          <option value="score">↓ RVOL</option><option value="alpha">A→Z</option><option value="chg">↓ % Chg</option>
+          <option value="score">↓ Opportunity</option><option value="alpha">A→Z</option><option value="chg">↓ % Chg</option>
         </select>
       </div>
       <div className="flex flex-col gap-1.5">
@@ -4573,8 +4702,11 @@ function Scanner({ universe, positions, onSelect }) {
                 <div className="flex items-baseline gap-1.5">
                   <div style={{ color: C.text }} className="text-base font-mono font-bold">{t.sym}</div>
                   {t.position.side !== "flat" && <div style={{ color: t.position.side === "long" ? C.long : C.short }} className="text-[11px] font-mono uppercase tracking-wider">• {t.position.side}</div>}
+                  {t.opportunityScore != null && (
+                    <div style={{ color: t.opportunityScore >= 60 ? C.long : t.opportunityScore >= 35 ? C.close : C.dim }} className="text-[11px] font-mono font-bold ml-auto">{t.opportunityScore}</div>
+                  )}
                 </div>
-                <div style={{ color: C.muted }} className="text-[13px] truncate">{t.mmgState} · {t.direction} · {t.rvol.toFixed(2)}x</div>
+                <div style={{ color: C.muted }} className="text-[13px] truncate">{t.mmgState} · {t.direction} · {t.rvol.toFixed(2)}x{t.opportunityReason ? " · " + t.opportunityReason : ""}</div>
               </div>
               <div className="text-right shrink-0">
                 <div style={{ color: C.text }} className="text-sm font-mono">${t.price.toFixed(2)}</div>
@@ -5302,7 +5434,7 @@ function ScannerStatus({ status, topRVOL }) {
     <div style={{ backgroundColor: C.surface, borderColor: C.border }} className="border rounded-xl p-3">
       <div className="flex items-center gap-2 mb-2">
         <div style={{ backgroundColor: dot }} className="w-2 h-2 rounded-full"></div>
-        <div style={{ color: C.muted }} className="text-[11px] tracking-[0.2em] font-mono font-bold flex-1">SCANNER — TOP 20 RVOL</div>
+        <div style={{ color: C.muted }} className="text-[11px] tracking-[0.2em] font-mono font-bold flex-1">SCANNER — TOP 20 OPPORTUNITIES</div>
         <div style={{ color: C.dim }} className="text-[11px] font-mono">{status.lastFetch ? new Date(status.lastFetch).toLocaleTimeString() : "—"}</div>
       </div>
       {status.status === "building" && <div style={{ color: "#f59e0b" }} className="text-[12px] font-mono">Building 20-day avg vol cache, please wait...</div>}
@@ -5312,7 +5444,7 @@ function ScannerStatus({ status, topRVOL }) {
         <div style={{ color: C.muted }}>Tickers w/ avg</div><div style={{ color: C.text }} className="text-right">{status.tickersFound || 0}</div>
         <div style={{ color: C.muted }}>Top 20 loaded</div><div style={{ color: C.text }} className="text-right">{(topRVOL && topRVOL.length) || 0}</div>
       </div>
-      <div style={{ color: C.dim }} className="text-[11px] mt-2">Scanner shows Top 20 by Relative Volume vs 20-day average, ranked across the Expanded Universe (~650 tickers: S&amp;P 500 + Nasdaq-100 + liquid ETFs + momentum names — not S&amp;P 500 only).</div>
+      <div style={{ color: C.dim }} className="text-[11px] mt-2">Scanner V2: ranks by Opportunity Score (signal freshness, trend, Five Legends, trade strength, RVOL, momentum, BB state, volume) across the Expanded Universe (~650 tickers: S&amp;P 500 + Nasdaq-100 + liquid ETFs + momentum names). RVOL alone is no longer the sole ranking factor.</div>
     </div>
   );
 }
@@ -6115,8 +6247,43 @@ function MTSApp() {
             stalePrev: todayV === 0,  // flag: using prevDay fallback
           });
         }
-        ranked.sort((a, b) => b.rvol - a.rvol);
-        setTopRVOL(ranked.slice(0, 20));
+        // ============================================================
+        // ToF v1.1 SCANNER V2 — Stage 1 complete (lightweight, full
+        // Expanded Universe, ~650 tickers, RVOL+move based). Stage 2:
+        // widen to a shortlist, run full MMG evaluation (same
+        // computeMMGEngineState already used elsewhere — no gamma, no
+        // OCM, no new endpoints), score, and take the final Top 20 by
+        // Opportunity Score. RVOL alone is never the final ranking.
+        // ============================================================
+        const SHORTLIST_SIZE = 60; // directive-sanctioned 50-100 range
+        const shortlist = buildScannerShortlist(ranked, SHORTLIST_SIZE);
+        const scored = [];
+        const SCAN_BATCH = 4;
+        for (let i = 0; i < shortlist.length; i += SCAN_BATCH) {
+          if (cancelled) return;
+          const batch = shortlist.slice(i, i + SCAN_BATCH);
+          const results = await Promise.allSettled(batch.map(async (cand) => {
+            const to = ymdDaysAgo(0);
+            const from = ymdDaysAgo(10);
+            const bars = await fetchMassiveBars(cand.sym, 15, "minute", from, to);
+            if (!bars || bars.length < 100) return null; // hard eligibility: sufficient bar history
+            // NOTE: intentionally computed WITHOUT mtfLadder here (Stage 2
+            // is a ranking pass, not execution) — the existing multi-ticker
+            // engine effect below computes the fuller mtfLadder-aware state
+            // for whichever tickers end up in the final Top 20, unchanged.
+            const engine = computeMMGEngineState(bars, { ticker: cand.sym });
+            if (!engine) return null;
+            const opp = computeOpportunityScore(engine, cand.rvol, bars.length);
+            return Object.assign({}, cand, { opportunityScore: opp.score, opportunityReason: opp.reason });
+          }));
+          for (const r of results) {
+            if (r.status === "fulfilled" && r.value) scored.push(r.value);
+          }
+          if (i + SCAN_BATCH < shortlist.length) await new Promise(res => setTimeout(res, 250));
+        }
+        if (cancelled) return;
+        scored.sort((a, b) => b.opportunityScore - a.opportunityScore);
+        setTopRVOL(scored.slice(0, 20));
         setScannerStatus(s => ({ ...s, status: "ok", lastFetch: Date.now() }));
       } catch (e) {
         if (cancelled) return;
@@ -6454,6 +6621,9 @@ function MTSApp() {
         },
         mtfLadder: eng.mtfLadder || null,
         opportunityDir: eng.opportunityDir || 0,
+        // ToF v1.1 Scanner V2 — Opportunity Score computed during ranking (Stage 2)
+        opportunityScore: r.opportunityScore != null ? r.opportunityScore : null,
+        opportunityReason: r.opportunityReason || null,
         _liveRow: true,
       };
     });
