@@ -106,10 +106,12 @@ test("18. GAMMA_MODE default SHADOW unchanged", () => {
 // enforceEcmProtectiveExits is deliberately self-contained (no React/JSX/
 // helpers), so we extract its source from index.html and execute it here.
 const fnMatch = html.match(/function enforceEcmProtectiveExits\(\{[\s\S]*?\n\}/);
+const shortMarginConstMatch = html.match(/const SHORT_MARGIN_RATE = 0\.50;/);
 let enforceEcmProtectiveExits = null;
 test("19. enforceEcmProtectiveExits exists and is extractable/executable", () => {
   assert.ok(fnMatch, "function source not found");
-  enforceEcmProtectiveExits = eval("(" + fnMatch[0] + ")");
+  assert.ok(shortMarginConstMatch, "SHORT_MARGIN_RATE constant not found");
+  enforceEcmProtectiveExits = new Function(shortMarginConstMatch[0] + "\n" + fnMatch[0] + "\nreturn enforceEcmProtectiveExits;")();
   assert.strictEqual(typeof enforceEcmProtectiveExits, "function");
 });
 
@@ -122,22 +124,24 @@ function openTrade(over) {
   }, over || {});
 }
 
-test("20. long stop: price <= stopPrice closes at market with correct negative pnl", () => {
+test("20. long stop: price <= stopPrice closes at market, restores sale proceeds (CATS paper account correction)", () => {
   const r = enforceEcmProtectiveExits({ ledger: [openTrade()], account: { balance: 1000 }, execState: {}, currentPrices: { AAA: 94 }, nowEtHour: 10 });
   assert.strictEqual(r.newLedger[0].status, "closed");
   assert.strictEqual(r.newLedger[0].exitType, "STOP");
   assert.strictEqual(r.newLedger[0].exitPrice, 94);
   assert.strictEqual(r.newLedger[0].realizedPnL, (94 - 100) * 10);
-  assert.strictEqual(r.newAccount.balance, 1000 + (94 - 100) * 10);
+  assert.strictEqual(r.newAccount.balance, 1000 + 94 * 10, "long exit restores closeShares*price (sale proceeds), not just pnl");
   assert.strictEqual(r.journal[0].reason, "STOP_HIT");
   assert.ok(r.newExecState.AAA.lastExitTime > 0, "cooldown timestamp must be set");
 });
 
-test("21. short stop: price >= stopPrice closes with correct pnl", () => {
+test("21. short stop: price >= stopPrice closes with correct pnl and releases margin+pnl to balance", () => {
   const t = openTrade({ dir: -1, entryPrice: 100, stopPrice: 105 });
   const r = enforceEcmProtectiveExits({ ledger: [t], account: { balance: 0 }, execState: {}, currentPrices: { AAA: 106 }, nowEtHour: 10 });
   assert.strictEqual(r.newLedger[0].exitType, "STOP");
-  assert.strictEqual(r.newLedger[0].realizedPnL, (100 - 106) * 10);
+  const pnl = (100 - 106) * 10;
+  assert.strictEqual(r.newLedger[0].realizedPnL, pnl);
+  assert.strictEqual(r.newAccount.balance, 10 * 100 * 0.50 + pnl, "short exit must release margin (entryPrice*shares*0.5) plus realized pnl");
 });
 
 test("22. no stop breach intraday: position stays open", () => {
@@ -420,6 +424,8 @@ function extractBundle(html) {
     grab(/function etNowParts\(\) \{[\s\S]*?\n\}/),
     grab(/function ecmSessionWindowCheck\(nowEt\) \{[\s\S]*?\n\}/),
     grab(/function ecmQualityCheck\(candidate, config\) \{[\s\S]*?\n\}/),
+    grab(/const SHORT_MARGIN_RATE = 0\.50;/),
+    grab(/function computeReconciledEquity\(cashBalance, openPositions, currentPrices, marginRate\) \{[\s\S]*?\n\}/),
     grab(/function processEngineSignals\(\{[\s\S]*?\n\}\n/),
   ];
   return pieces.join("\n");

@@ -93,7 +93,7 @@ test("6. trend alignment (livermoreGreen + activeTrainDir) materially affects sc
 
 // ---- 7. Invalid/missing-data ticker excluded (structural) -----------------
 test("7. Stage 2 evaluation loop hard-excludes tickers with insufficient bars or no engine result", () => {
-  const stageTwo = html.match(/const SHORTLIST_SIZE = 60;[\s\S]*?setTopRVOL\(scored\.slice\(0, 20\)\);/)[0];
+  const stageTwo = html.match(/const SHORTLIST_SIZE = 60;[\s\S]*?setTopRVOL\(filtered\.slice\(0, 20\)\);/)[0];
   assert.ok(/if \(!bars \|\| bars\.length < 100\) return null;/.test(stageTwo), "must reject insufficient bar history");
   assert.ok(/if \(!engine\) return null;/.test(stageTwo), "must reject tickers where MMG computation failed");
 });
@@ -115,8 +115,8 @@ test("9. ECM's rvolBySym / scanTickers are still derived from topRVOL, unchanged
   assert.ok(/const scanTickers = topRVOL\.slice\(0, 20\)\.map\(t => t\.sym\);/.test(html));
 });
 test("9b. Stage 2 output objects preserve .sym and .rvol so ECM's existing consumers keep working", () => {
-  const stageTwo = html.match(/const SHORTLIST_SIZE = 60;[\s\S]*?setTopRVOL\(scored\.slice\(0, 20\)\);/)[0];
-  assert.ok(/Object\.assign\(\{\}, cand, \{ opportunityScore: opp\.score, opportunityReason: opp\.reason \}\)/.test(stageTwo), "must spread the original candidate (which carries sym/rvol/price/etc.) forward");
+  const stageTwo = html.match(/const SHORTLIST_SIZE = 60;[\s\S]*?setTopRVOL\(filtered\.slice\(0, 20\)\);/)[0];
+  assert.ok(/Object\.assign\(\{\}, cand, \{/.test(stageTwo), "must spread the original candidate (which carries sym/rvol/price/etc.) forward");
 });
 
 // ---- 10. No regression to OCM, Gamma, or Item #17 --------------------------
