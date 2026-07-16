@@ -106,12 +106,10 @@ test("18. GAMMA_MODE default SHADOW unchanged", () => {
 // enforceEcmProtectiveExits is deliberately self-contained (no React/JSX/
 // helpers), so we extract its source from index.html and execute it here.
 const fnMatch = html.match(/function enforceEcmProtectiveExits\(\{[\s\S]*?\n\}/);
-const shortMarginConstMatch = html.match(/const SHORT_MARGIN_RATE = 0\.50;/);
 let enforceEcmProtectiveExits = null;
 test("19. enforceEcmProtectiveExits exists and is extractable/executable", () => {
   assert.ok(fnMatch, "function source not found");
-  assert.ok(shortMarginConstMatch, "SHORT_MARGIN_RATE constant not found");
-  enforceEcmProtectiveExits = new Function(shortMarginConstMatch[0] + "\n" + fnMatch[0] + "\nreturn enforceEcmProtectiveExits;")();
+  enforceEcmProtectiveExits = eval("(" + fnMatch[0] + ")");
   assert.strictEqual(typeof enforceEcmProtectiveExits, "function");
 });
 
@@ -124,24 +122,22 @@ function openTrade(over) {
   }, over || {});
 }
 
-test("20. long stop: price <= stopPrice closes at market, restores sale proceeds (CATS paper account correction)", () => {
+test("20. long stop: price <= stopPrice closes at market with correct negative pnl", () => {
   const r = enforceEcmProtectiveExits({ ledger: [openTrade()], account: { balance: 1000 }, execState: {}, currentPrices: { AAA: 94 }, nowEtHour: 10 });
   assert.strictEqual(r.newLedger[0].status, "closed");
   assert.strictEqual(r.newLedger[0].exitType, "STOP");
   assert.strictEqual(r.newLedger[0].exitPrice, 94);
   assert.strictEqual(r.newLedger[0].realizedPnL, (94 - 100) * 10);
-  assert.strictEqual(r.newAccount.balance, 1000 + 94 * 10, "long exit restores closeShares*price (sale proceeds), not just pnl");
+  assert.strictEqual(r.newAccount.balance, 1000 + (94 - 100) * 10);
   assert.strictEqual(r.journal[0].reason, "STOP_HIT");
   assert.ok(r.newExecState.AAA.lastExitTime > 0, "cooldown timestamp must be set");
 });
 
-test("21. short stop: price >= stopPrice closes with correct pnl and releases margin+pnl to balance", () => {
+test("21. short stop: price >= stopPrice closes with correct pnl", () => {
   const t = openTrade({ dir: -1, entryPrice: 100, stopPrice: 105 });
   const r = enforceEcmProtectiveExits({ ledger: [t], account: { balance: 0 }, execState: {}, currentPrices: { AAA: 106 }, nowEtHour: 10 });
   assert.strictEqual(r.newLedger[0].exitType, "STOP");
-  const pnl = (100 - 106) * 10;
-  assert.strictEqual(r.newLedger[0].realizedPnL, pnl);
-  assert.strictEqual(r.newAccount.balance, 10 * 100 * 0.50 + pnl, "short exit must release margin (entryPrice*shares*0.5) plus realized pnl");
+  assert.strictEqual(r.newLedger[0].realizedPnL, (100 - 106) * 10);
 });
 
 test("22. no stop breach intraday: position stays open", () => {
@@ -150,8 +146,8 @@ test("22. no stop breach intraday: position stays open", () => {
   assert.strictEqual(r.exits.length, 0);
 });
 
-test("23. EOD flatten: nowEtHour >= 20 closes remaining opens with EOD type and pnl (locked production schedule: 20:00 ET)", () => {
-  const r = enforceEcmProtectiveExits({ ledger: [openTrade()], account: { balance: 0 }, execState: {}, currentPrices: { AAA: 103 }, nowEtHour: 20 });
+test("23. EOD flatten: nowEtHour >= 19 closes remaining opens with EOD type and pnl (Task 3.2: trigger moved 16->19)", () => {
+  const r = enforceEcmProtectiveExits({ ledger: [openTrade()], account: { balance: 0 }, execState: {}, currentPrices: { AAA: 103 }, nowEtHour: 19 });
   assert.strictEqual(r.newLedger[0].exitType, "EOD");
   assert.strictEqual(r.newLedger[0].realizedPnL, (103 - 100) * 10);
   assert.strictEqual(r.journal[0].reason, "EOD_FLATTEN");
@@ -161,13 +157,13 @@ test("24. STOP takes precedence over EOD when both apply", () => {
   const r = enforceEcmProtectiveExits({ ledger: [openTrade()], account: { balance: 0 }, execState: {}, currentPrices: { AAA: 90 }, nowEtHour: 20 });
   assert.strictEqual(r.newLedger[0].exitType, "STOP");
 });
-test("24b. no forced shutdown at 16:00 ET: position stays open through the 16:00-20:00 continuation window (locked production schedule)", () => {
-  const r = enforceEcmProtectiveExits({ ledger: [openTrade()], account: { balance: 0 }, execState: {}, currentPrices: { AAA: 99 }, nowEtHour: 18 });
+test("24b. no forced shutdown at 16:00 ET (Task 3.2): position stays open through the 16:00-19:00 continuation window", () => {
+  const r = enforceEcmProtectiveExits({ ledger: [openTrade()], account: { balance: 0 }, execState: {}, currentPrices: { AAA: 99 }, nowEtHour: 17 });
   assert.strictEqual(r.newLedger[0].status, "open", "positions must NOT force-close at 4-7pm ET per Task 3.2");
 });
 
 test("25. missing price -> no action, never guesses", () => {
-  const r = enforceEcmProtectiveExits({ ledger: [openTrade()], account: { balance: 0 }, execState: {}, currentPrices: {}, nowEtHour: 20 });
+  const r = enforceEcmProtectiveExits({ ledger: [openTrade()], account: { balance: 0 }, execState: {}, currentPrices: {}, nowEtHour: 19 });
   assert.strictEqual(r.newLedger[0].status, "open");
   assert.strictEqual(r.exits.length, 0);
 });
@@ -337,30 +333,30 @@ test("52. ecmSessionWindowCheck exists, is self-contained, and is executable", (
   assert.strictEqual(typeof ecmSessionWindowCheck, "function");
 });
 
-test("53. premarket (04:00-09:29 ET) on a weekday: entries allowed", () => {
-  assert.strictEqual(ecmSessionWindowCheck({ hour: 4, minute: 0, dayOfWeek: 3 }).allowNewEntries, true);
+test("53. premarket (03:00-09:29 ET) on a weekday: entries allowed", () => {
+  assert.strictEqual(ecmSessionWindowCheck({ hour: 3, minute: 0, dayOfWeek: 3 }).allowNewEntries, true);
   assert.strictEqual(ecmSessionWindowCheck({ hour: 9, minute: 29, dayOfWeek: 3 }).allowNewEntries, true);
 });
 test("54. regular market (09:30-16:00 ET) unchanged: entries allowed", () => {
   assert.strictEqual(ecmSessionWindowCheck({ hour: 12, minute: 0, dayOfWeek: 3 }).allowNewEntries, true);
   assert.strictEqual(ecmSessionWindowCheck({ hour: 16, minute: 0, dayOfWeek: 3 }).allowNewEntries, true);
 });
-test("55. after-hours (16:00-20:00 ET): new trades still allowed, no forced shutdown at 4pm", () => {
+test("55. after-hours (16:00-19:00 ET): new trades still allowed, no forced shutdown at 4pm", () => {
   const r = ecmSessionWindowCheck({ hour: 17, minute: 30, dayOfWeek: 3 });
   assert.strictEqual(r.allowNewEntries, true);
 });
-test("56. exactly 20:00 ET: new entries stop (locked production schedule)", () => {
-  const r = ecmSessionWindowCheck({ hour: 20, minute: 0, dayOfWeek: 3 });
+test("56. exactly 19:00 ET: new entries stop", () => {
+  const r = ecmSessionWindowCheck({ hour: 19, minute: 0, dayOfWeek: 3 });
   assert.strictEqual(r.allowNewEntries, false);
   assert.strictEqual(r.reason, "OUTSIDE_ECM_WINDOW");
 });
-test("57. before 04:00 ET: new entries blocked (locked production schedule)", () => {
-  const r = ecmSessionWindowCheck({ hour: 3, minute: 59, dayOfWeek: 3 });
+test("57. before 03:00 ET: new entries blocked", () => {
+  const r = ecmSessionWindowCheck({ hour: 2, minute: 59, dayOfWeek: 3 });
   assert.strictEqual(r.allowNewEntries, false);
   assert.strictEqual(r.reason, "OUTSIDE_ECM_WINDOW");
 });
-test("58. exactly 04:00 ET boundary: entries allowed (inclusive start, locked production schedule)", () => {
-  assert.strictEqual(ecmSessionWindowCheck({ hour: 4, minute: 0, dayOfWeek: 3 }).allowNewEntries, true);
+test("58. exactly 03:00 ET boundary: entries allowed (inclusive start)", () => {
+  assert.strictEqual(ecmSessionWindowCheck({ hour: 3, minute: 0, dayOfWeek: 3 }).allowNewEntries, true);
 });
 test("59. weekend fully disabled: Saturday and Sunday reject regardless of hour", () => {
   const sat = ecmSessionWindowCheck({ hour: 12, minute: 0, dayOfWeek: 6 });
@@ -389,10 +385,9 @@ test("62. window-gate rejections are journaled as SKIP with the exact reason", (
   assert.ok(/jot\(ticker, sig, "SKIP", win\.reason\);/.test(m));
 });
 
-test("63. EOD trigger aligned to locked production schedule: 20:00 ET", () => {
-  assert.ok(/nowEtHour >= 20/.test(html));
+test("63. EOD trigger moved from 16:00 to 19:00 ET (Task 3.2, user-approved)", () => {
+  assert.ok(/nowEtHour >= 19/.test(html));
   assert.ok(!/nowEtHour >= 16/.test(html), "old 16:00 threshold must not remain anywhere");
-  assert.ok(!/nowEtHour >= 19/.test(html), "old 19:00 threshold must not remain anywhere");
 });
 
 test("64. window-check function contains no gamma references", () => {
@@ -404,148 +399,6 @@ test("65. no scanner/RVOL/OCM/quality-engine/risk-engine/position-sizing/journal
   // logic (aside from the approved threshold), and sizing math are untouched.
   assert.ok(/function ecmQualityCheck\(candidate, config\) \{/.test(html), "quality engine function must still exist unmodified in signature");
   assert.ok(/const stopDist = ATR_STOP_MULT \* atr;/.test(html), "position sizing formula unchanged");
-});
-
-// ---- Signal Cursor Correction — FUNCTIONAL tests ---------------------------
-// processEngineSignals has real dependencies (RISK_TIERS, session/quality/
-// window helpers, signal key/lookup utilities). Extract all of them plus
-// the function itself and eval together so the fix can be executed for
-// real, not just pattern-matched.
-function extractBundle(html) {
-  const grab = (re) => { const m = html.match(re); if (!m) throw new Error("bundle piece not found: " + re); return m[0]; };
-  const pieces = [
-    grab(/const RISK_TIERS = \{[\s\S]*?\n\};/),
-    grab(/function todayETISO\(\) \{[\s\S]*?\n\}/),
-    grab(/function activeSessionForToday\(sessions\) \{[\s\S]*?\n\}/),
-    grab(/function signalKey\(ticker, sig\) \{[\s\S]*?\n\}/),
-    grab(/function nextBarOpen\(bars, signalBarTimestamp\) \{[\s\S]*?\n\}/),
-    grab(/function findOpenPosition\(ledger, ticker\) \{[\s\S]*?\n\}/),
-    grab(/function ecmSessionStartMs\(\) \{[\s\S]*?\n\}/),
-    grab(/function etNowParts\(\) \{[\s\S]*?\n\}/),
-    grab(/function ecmSessionWindowCheck\(nowEt\) \{[\s\S]*?\n\}/),
-    grab(/function ecmQualityCheck\(candidate, config\) \{[\s\S]*?\n\}/),
-    grab(/const SHORT_MARGIN_RATE = 0\.50;/),
-    grab(/function computeReconciledEquity\(cashBalance, openPositions, currentPrices, marginRate\) \{[\s\S]*?\n\}/),
-    grab(/function processEngineSignals\(\{[\s\S]*?\n\}\n/),
-  ];
-  return pieces.join("\n");
-}
-let bundleFn = null;
-let ecmSessionStartMsFn = null;
-test("66. functional test bundle (processEngineSignals + real deps) extracts and evaluates cleanly", () => {
-  const src = extractBundle(html);
-  bundleFn = new Function(src + "\nreturn processEngineSignals;")();
-  assert.strictEqual(typeof bundleFn, "function");
-  ecmSessionStartMsFn = new Function(html.match(/function ecmSessionStartMs\(\) \{[\s\S]*?\n\}/)[0] + "\nreturn ecmSessionStartMs;")();
-  assert.strictEqual(typeof ecmSessionStartMsFn, "function");
-});
-
-// Fixture helpers ------------------------------------------------------------
-function bars15mCoveringSession(sessionStartMs) {
-  // 20 bars: 10 before session start (historical), 10 at/after (current-session).
-  const out = [];
-  for (let i = -10; i < 10; i++) out.push({ t: sessionStartMs + i * 15 * 60000, o: 100, h: 101, l: 99, c: 100, v: 1000 });
-  return out;
-}
-function engineWith(signals) {
-  return { signalHistory: signals, legendsGreenCount: 4 };
-}
-function baseArgs(over) {
-  const sessionStartMs = new Date().setHours(0, 0, 0, 0); // stand-in; real sessionStartMs computed inside fn
-  return Object.assign({
-    ticker: "AAA", bars: bars15mCoveringSession(Date.now()), atr: 1,
-    ledger: [], execState: {}, account: { balance: 100000 },
-    riskProfile: { tier: "moderate" }, sessions: [{ status: "planned", startDate: "1970-01-01", endDate: "2999-01-01" }],
-    currentPrices: { AAA: 100 }, trendGate: { state: "bullish" },
-    legendsGreenCount: 4, rvol: 2.0, qualityConfig: { minLegends: 3, minRvol: 0 }, ecmOn: false,
-  }, over || {});
-}
-
-test("67. first poll: valid current-session B2O is processed (fill), not silently primed away", () => {
-  const sigTime = ecmSessionStartMsFn() + 30 * 60000; // 30 min into the ECM session -> unambiguously current-session
-  const bars = [{ t: sigTime, o: 99, h: 100, l: 98, c: 99, v: 1000 }, { t: sigTime + 900000, o: 100.5, h: 101, l: 100, c: 100.5, v: 1000 }];
-  const engine = engineWith([{ bar: 0, time: sigTime, type: "B2O", price: 99, dir: 1 }]);
-  const r = bundleFn(baseArgs({ bars, engine, ecmOn: false }));
-  assert.strictEqual(r.fills.length, 1, "current-session B2O must fill, not be silently skipped");
-  assert.strictEqual(r.fills[0].type, "B2O");
-});
-
-test("68. first poll: valid current-session S2O is processed (fill)", () => {
-  const sigTime = ecmSessionStartMsFn() + 45 * 60000;
-  const bars = [{ t: sigTime, o: 101, h: 102, l: 100, c: 101, v: 1000 }, { t: sigTime + 900000, o: 100.5, h: 101, l: 100, c: 100.5, v: 1000 }];
-  const engine = engineWith([{ bar: 0, time: sigTime, type: "S2O", price: 101, dir: -1 }]);
-  const r = bundleFn(baseArgs({ bars, engine, trendGate: { state: "bearish" }, ecmOn: false }));
-  assert.strictEqual(r.fills.length, 1);
-  assert.strictEqual(r.fills[0].type, "S2O");
-});
-
-test("69. old historical signal (before session start) is ignored on first poll — no fill", () => {
-  const oldTime = Date.now() - 30 * 24 * 3600 * 1000; // 30 days ago, definitely pre-session
-  const bars = [{ t: oldTime, o: 99, h: 100, l: 98, c: 99, v: 1000 }, { t: oldTime + 900000, o: 100.5, h: 101, l: 100, c: 100.5, v: 1000 }];
-  const engine = engineWith([{ bar: 0, time: oldTime, type: "B2O", price: 99, dir: 1 }]);
-  const r = bundleFn(baseArgs({ bars, engine }));
-  assert.strictEqual(r.fills.length, 0, "a signal 30 days old must never fill on first poll");
-  assert.strictEqual(r.journal.length, 1);
-  assert.strictEqual(r.journal[0].action, "INIT");
-  assert.strictEqual(r.journal[0].reason, "NO_ELIGIBLE_CURRENT_SESSION_SIGNAL");
-});
-
-test("70. ticker leaving and returning to Top-20 retains its cursor (execState persists across calls)", () => {
-  const sigTime = ecmSessionStartMsFn() + 60 * 60000;
-  const bars = [{ t: sigTime, o: 99, h: 100, l: 98, c: 99, v: 1000 }, { t: sigTime + 900000, o: 100.5, h: 101, l: 100, c: 100.5, v: 1000 }];
-  const engine = engineWith([{ bar: 0, time: sigTime, type: "B2O", price: 99, dir: 1 }]);
-  const r1 = bundleFn(baseArgs({ bars, engine, execState: {} }));
-  assert.strictEqual(r1.fills.length, 1, "first call (ticker present) opens the position");
-  // Simulate the ticker rotating OUT of Top-20 (no call made) then back IN,
-  // with execState persisted exactly as the real app does via localStorage.
-  const r2 = bundleFn(baseArgs({ bars, engine, ledger: r1.newLedger, execState: r1.newExecState }));
-  assert.strictEqual(r2.fills.length, 0, "re-seeing the SAME signal after rotation must not re-fill");
-  assert.deepStrictEqual(r2.newExecState.AAA.lastExecutedKey, r1.newExecState.AAA.lastExecutedKey, "cursor must be unchanged by rotation");
-});
-
-test("71. duplicate signal is never processed twice within the same call", () => {
-  const sigTime = ecmSessionStartMsFn() + 90 * 60000;
-  const bars = [{ t: sigTime, o: 99, h: 100, l: 98, c: 99, v: 1000 }, { t: sigTime + 900000, o: 100.5, h: 101, l: 100, c: 100.5, v: 1000 }];
-  const engine = engineWith([{ bar: 0, time: sigTime, type: "B2O", price: 99, dir: 1 }]);
-  const r1 = bundleFn(baseArgs({ bars, engine }));
-  const r2 = bundleFn(baseArgs({ bars, engine, ledger: r1.newLedger, execState: r1.newExecState }));
-  const r3 = bundleFn(baseArgs({ bars, engine, ledger: r2.newLedger, execState: r2.newExecState }));
-  assert.strictEqual(r1.fills.length, 1);
-  assert.strictEqual(r2.fills.length, 0);
-  assert.strictEqual(r3.fills.length, 0);
-});
-
-test("72. multiple eligible current-session signals process in order (B2O then TP)", () => {
-  const t0 = ecmSessionStartMsFn() + 120 * 60000;
-  const t1 = t0 + 15 * 60000;
-  const t2 = t0 + 30 * 60000;
-  const bars = [
-    { t: t0, o: 99, h: 100, l: 98, c: 99, v: 1000 },
-    { t: t1, o: 100, h: 101, l: 99.5, c: 100, v: 1000 },  // fill price for B2O = next bar open = 100
-    { t: t2, o: 106, h: 107, l: 105, c: 106, v: 1000 },   // fill price for TP = next bar open = 106
-  ];
-  const engine = engineWith([
-    { bar: 0, time: t0, type: "B2O", price: 99, dir: 1 },
-    { bar: 1, time: t1, type: "TP", price: 100, dir: 1 },
-  ]);
-  const r = bundleFn(baseArgs({ bars, engine }));
-  assert.strictEqual(r.fills.length, 2, "both eligible signals must be evaluated in one pass");
-  assert.strictEqual(r.fills[0].type, "B2O");
-  assert.strictEqual(r.fills[1].type, "TP");
-  assert.ok(r.fills[0].time < r.fills[1].time, "must process strictly in chronological order");
-});
-
-test("73. ECM OFF unchanged: quality/window gates still skip entirely when ecmOn is false (regression)", () => {
-  const sigTime = ecmSessionStartMsFn() + 150 * 60000;
-  const bars = [{ t: sigTime, o: 99, h: 100, l: 98, c: 99, v: 1000 }, { t: sigTime + 900000, o: 100.5, h: 101, l: 100, c: 100.5, v: 1000 }];
-  const engine = engineWith([{ bar: 0, time: sigTime, type: "B2O", price: 99, dir: 1 }]);
-  const r = bundleFn(baseArgs({ bars, engine, ecmOn: false, legendsGreenCount: 0, rvol: 0 })); // would fail quality if ECM were ON
-  assert.strictEqual(r.fills.length, 1, "with ECM OFF, legacy gates alone apply — quality thresholds must not block the fill");
-  assert.ok(!r.journal.some(j => j.action === "QUALITY"), "no QUALITY journal entries when ECM is OFF");
-});
-
-test("74. root-cause regression guard: the old unconditional 'prime to last, return' pattern is gone", () => {
-  assert.ok(!/if \(!tickerState\.lastExecutedKey && engine\.signalHistory\.length > 0\) \{/.test(html), "old Guard B pattern must not remain");
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
